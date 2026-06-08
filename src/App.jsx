@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { version } from "../package.json";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./index.css";
 import FileBrowser from "./components/FileBrowser";
 import RobocopyPanel from "./components/RobocopyPanel";
@@ -58,6 +60,23 @@ export default function App() {
   const [destPath, setDestPath]     = useState("");
   const [loadedJob, setLoadedJob]   = useState(null);
 
+  const [updateInfo, setUpdateInfo] = useState(null);
+  const [updating, setUpdating]     = useState(false);
+
+  useEffect(() => {
+    // Chequea actualizaciones silenciosamente al iniciar
+    check().then(update => {
+      if (update?.available) setUpdateInfo(update);
+    }).catch(() => {}); // silencioso si no hay internet
+  }, []);
+
+  async function installUpdate() {
+    if (!updateInfo) return;
+    setUpdating(true);
+    await updateInfo.downloadAndInstall();
+    await relaunch();
+  }
+
   function handleLoadJob(job) {
     setLoadedJob({ ...job, _ts: Date.now() }); // _ts fuerza el useEffect aunque sea el mismo trabajo
     setActiveTab("robocopy");
@@ -105,6 +124,29 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* ── Banner de actualización ──────────────────────────────────────────── */}
+      {updateInfo && (
+        <div className="flex items-center gap-3 px-5 py-2 bg-blue-950 border-b border-blue-800 shrink-0 text-sm">
+          <span className="text-blue-400">⬆</span>
+          <span className="text-blue-200">
+            Nueva versión disponible: <strong>v{updateInfo.version}</strong>
+          </span>
+          <button
+            onClick={installUpdate}
+            disabled={updating}
+            className="ml-2 px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-white text-xs font-medium disabled:opacity-50"
+          >
+            {updating ? "Instalando..." : "Actualizar ahora"}
+          </button>
+          <button
+            onClick={() => setUpdateInfo(null)}
+            className="ml-auto text-blue-600 hover:text-blue-400 text-xs"
+          >
+            Más tarde
+          </button>
+        </div>
+      )}
 
       {/* ── Pestañas ─────────────────────────────────────────────────────────── */}
       <nav className="flex gap-1 px-4 pt-2 bg-gray-900 border-b border-gray-800 shrink-0">
