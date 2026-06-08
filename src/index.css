@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* Scrollbar oscura para los paneles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #111827;
+}
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
+
+/* Quita el highlight azul del drag en la app */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Permitir selección solo en el output y campos de texto */
+input, textarea, .selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: #030712;
+}
