@@ -1,9 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+struct ProcessState {
+    pid: Mutex<Option<u32>>,
+    cancelled: AtomicBool,
+}
 
 // ─── Estructuras de datos ────────────────────────────────────────────────────
 
@@ -153,6 +160,12 @@ async fn run_robocopy(
     }
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    // Guarda el PID para poder cancelar
+    let state = app.state::<ProcessState>();
+    state.cancelled.store(false, Ordering::SeqCst);
+    *state.pid.lock().unwrap() = child.id();
+
     let stdout = child.stdout.take().ok_or("No se pudo capturar stdout")?;
     let mut lines = BufReader::new(stdout).lines();
 
@@ -161,6 +174,7 @@ async fn run_robocopy(
     }
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
+    *state.pid.lock().unwrap() = None;
     let code = status.code().unwrap_or(-1);
     let _ = app.emit("robocopy-done", code);
     Ok(code)
@@ -202,8 +216,12 @@ async fn run_robocopy_multi(
     flags: Vec<String>,
 ) -> Result<Vec<i32>, String> {
     let mut codes: Vec<i32> = vec![];
+    let state = app.state::<ProcessState>();
+    state.cancelled.store(false, Ordering::SeqCst);
 
     for folder in &folders {
+        if state.cancelled.load(Ordering::SeqCst) { break; }
+
         let src = format!("{}\\{}", parent_source, folder);
         let dst = format!("{}\\{}", parent_dest, folder);
 
@@ -223,6 +241,8 @@ async fn run_robocopy_multi(
         }
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        *state.pid.lock().unwrap() = child.id();
+
         let stdout = child.stdout.take().ok_or("No stdout")?;
         let mut lines = BufReader::new(stdout).lines();
 
@@ -231,12 +251,30 @@ async fn run_robocopy_multi(
         }
 
         let code = child.wait().await.map_err(|e| e.to_string())?.code().unwrap_or(-1);
+        *state.pid.lock().unwrap() = None;
         codes.push(code);
         let _ = app.emit("robocopy-folder-done", code);
     }
 
     let _ = app.emit("robocopy-all-done", &codes);
     Ok(codes)
+}
+
+#[tauri::command]
+fn cancel_robocopy(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<ProcessState>();
+    state.cancelled.store(true, Ordering::SeqCst);
+    if let Some(pid) = *state.pid.lock().unwrap() {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/F", "/T"]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -249,6 +287,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(ProcessState { pid: Mutex::new(None), cancelled: AtomicBool::new(false) })
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -270,6 +309,7 @@ pub fn run() {
             get_parent_path,
             run_robocopy,
             run_robocopy_multi,
+            cancel_robocopy,
             save_job,
             load_jobs,
             delete_job,

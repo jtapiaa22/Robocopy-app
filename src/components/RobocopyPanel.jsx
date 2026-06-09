@@ -370,7 +370,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const isDryRun = options["/L"];
 
   return (
-    <div className="flex flex-col h-full bg-gray-950 text-gray-100 overflow-hidden">
+    <div className="flex flex-col h-full bg-gray-950 text-gray-100 overflow-y-auto">
 
       {/* ── Rutas ──────────────────────────────────────────────────────────── */}
       <div className="p-4 bg-gray-900 border-b border-gray-800 shrink-0 space-y-3">
@@ -523,9 +523,13 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       {/* ── Botón de inicio + guardar trabajo ───────────────────────────────── */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-gray-900 border-b border-gray-800 shrink-0">
         {running ? (
-          <button onClick={() => {}} className="flex items-center gap-2 px-5 py-2 bg-red-900 rounded-lg text-sm font-semibold text-red-300 cursor-default">
+          <button
+            onClick={() => invoke("cancel_robocopy").catch(() => {})}
+            className="flex items-center gap-2 px-5 py-2 bg-red-800 hover:bg-red-700 rounded-lg text-sm font-semibold text-red-200 transition-colors"
+          >
             <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
             {isDryRun ? "Simulando..." : "Copiando..."}
+            <span className="ml-1 text-red-400 text-xs border border-red-700 rounded px-1.5 py-0.5">✕ Cancelar</span>
           </button>
         ) : (
           <button onClick={startRobocopy} disabled={!canRun}
@@ -536,7 +540,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             ? "🔍 Simular (sin copiar)"
             : sourceFolders.length > 0
               ? `▶ Copiar ${sourceFolders.length} carpetas`
-              : "▶ Iniciar copia"}
+              : "Iniciar"}
           </button>
         )}
 
@@ -634,7 +638,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       )}
 
       {/* ── Output ──────────────────────────────────────────────────────────── */}
-      <div ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950">
+      <div ref={outputRef} className="min-h-[300px] flex-1 bg-gray-950">
 
         {/* Tarjeta de resumen (aparece cuando termina) */}
         {summary && exitCode !== null && !running && (
@@ -689,9 +693,20 @@ function PathField({ label, value, onChange, color, placeholder, onBrowse }) {
     <div>
       <label className="block text-xs text-gray-500 uppercase tracking-wider mb-1.5">{label}</label>
       <div className="flex gap-2">
-        <input type="text" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
-          className={`selectable flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm
-            text-gray-200 placeholder-gray-600 focus:outline-none ${focusColor}`} />
+        <div className="relative flex-1">
+          <input type="text" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+            className={`selectable w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 pr-8 text-sm
+              text-gray-200 placeholder-gray-600 focus:outline-none ${focusColor}`} />
+          {value && (
+            <button
+              onClick={() => onChange("")}
+              title="Limpiar"
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-600 hover:text-gray-300 transition-colors"
+            >
+              ✕
+            </button>
+          )}
+        </div>
         <button onClick={handleNativeDialog} title="Seleccionar con explorador de Windows"
           className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-400 transition-colors text-base">
           🗂
