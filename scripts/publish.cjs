@@ -14,97 +14,125 @@ function run(cmd, extraEnv = {}) {
   execSync(cmd, { stdio: "inherit", env: { ...process.env, ...extraEnv } });
 }
 
-function capture(cmd) {
-  return execSync(cmd, { stdio: "pipe" }).toString().trim();
+// Captura solo stdout (npm escribe sus propias líneas en stderr)
+function capture(cmd, extraEnv = {}) {
+  return execSync(cmd, { stdio: "pipe", env: { ...process.env, ...extraEnv } }).toString().trim();
 }
 
-function findIn(dir, pred) {
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter(pred).map(f => path.join(dir, f));
+// Archivo más reciente que cumpla el predicado
+function findNewest(dir, pred) {
+  if (!fs.existsSync(dir)) return null;
+  const matches = fs.readdirSync(dir)
+    .filter(pred)
+    .map(name => ({ name, mt: fs.statSync(path.join(dir, name)).mtimeMs }))
+    .sort((a, b) => b.mt - a.mt);
+  return matches.length ? path.join(dir, matches[0].name) : null;
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+function ghUpload(file) {
+  console.log(`📤  Subiendo ${path.basename(file)}...`);
+  run(`gh release upload "${tag}" "${file}" --repo ${REPO}`);
+}
+
+// ── Validaciones ──────────────────────────────────────────────────────────────
 
 console.log(`\n🚀  RoboCopy GUI ${tag} — build local + publish\n`);
 
-// 1. Sin cambios sin commitear
 const dirty = capture("git status --porcelain");
 if (dirty) {
   console.error("❌  Tenés cambios sin commitear. Hacé commit primero.");
   process.exit(1);
 }
 
-// 2. Tag no debe existir todavía
 try {
   capture(`git rev-parse ${tag}`);
   console.error(`❌  El tag ${tag} ya existe. Actualizá la versión en package.json.`);
   process.exit(1);
 } catch (_) {}
 
-// 3. Clave de firma: env → archivo .tauri-signing-key
-let signingKey = process.env.TAURI_SIGNING_PRIVATE_KEY;
-if (!signingKey) {
-  const keyFile = path.join(__dirname, "../.tauri-signing-key");
-  if (fs.existsSync(keyFile)) {
-    signingKey = fs.readFileSync(keyFile, "utf-8").trim();
-    console.log("🔑  Clave cargada desde .tauri-signing-key");
-  } else {
-    console.error("❌  No se encontró la clave de firma.");
-    console.error("    Opción A: exportá TAURI_SIGNING_PRIVATE_KEY como variable de entorno.");
-    console.error("    Opción B: guardá la clave en .tauri-signing-key (está en .gitignore).");
-    process.exit(1);
-  }
-} else {
-  console.log("🔑  Clave cargada desde variable de entorno.");
-}
+// ── Clave de firma ────────────────────────────────────────────────────────────
 
-// 4. Compilar
-console.log("\n🔨  Compilando (puede tardar varios minutos)...\n");
-run("npm run tauri build", {
-  TAURI_SIGNING_PRIVATE_KEY: signingKey,
-  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
-});
-
-// 5. Localizar artefactos
-const bundleDir = path.join(__dirname, "../src-tauri/target/release/bundle");
-const nsisDir   = path.join(bundleDir, "nsis");
-const msiDir    = path.join(bundleDir, "msi");
-
-const nsisExe  = findIn(nsisDir, f => f.endsWith("-setup.exe"));
-const nsisZip  = findIn(nsisDir, f => f.endsWith(".nsis.zip") && !f.endsWith(".sig"));
-const nsisSig  = findIn(nsisDir, f => f.endsWith(".nsis.zip.sig"));
-const msiFile  = findIn(msiDir,  f => f.endsWith(".msi") && !f.endsWith(".zip"));
-const msiZip   = findIn(msiDir,  f => f.endsWith(".msi.zip") && !f.endsWith(".sig"));
-const msiSig   = findIn(msiDir,  f => f.endsWith(".msi.zip.sig"));
-
-if (!nsisZip[0] || !nsisSig[0]) {
-  console.error("❌  No se encontraron los archivos NSIS en target/release/bundle/nsis/");
-  console.error("    Verificá que el build terminó sin errores.");
+const keyFile = path.resolve(__dirname, "../.tauri-signing-key");
+if (!fs.existsSync(keyFile) && !process.env.TAURI_SIGNING_PRIVATE_KEY) {
+  console.error("❌  No se encontró la clave de firma (.tauri-signing-key)");
   process.exit(1);
 }
 
-// 6. Tag + push
+// En Windows, los saltos de línea en env vars se cortan → base64 evita el problema
+const keyRaw    = process.env.TAURI_SIGNING_PRIVATE_KEY || fs.readFileSync(keyFile, "utf-8");
+const keyBase64 = Buffer.from(keyRaw).toString("base64");
+console.log("🔑  Clave de firma cargada.");
+
+// ── Build ─────────────────────────────────────────────────────────────────────
+
+console.log("\n🔨  Compilando (puede tardar varios minutos)...\n");
+run("npm run tauri build", {
+  TAURI_SIGNING_PRIVATE_KEY: keyBase64,
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
+});
+
+// ── Localizar instaladores ────────────────────────────────────────────────────
+
+const bundleDir = path.resolve(__dirname, "../src-tauri/target/release/bundle");
+const nsisDir   = path.join(bundleDir, "nsis");
+const msiDir    = path.join(bundleDir, "msi");
+
+const isVer = f => f.includes(`_${version}_`);
+
+const nsisExe = findNewest(nsisDir, f => isVer(f) && f.endsWith("-setup.exe"));
+const msiFile = findNewest(msiDir,  f => isVer(f) && f.endsWith(".msi") && !f.endsWith(".zip"));
+
+if (!nsisExe) {
+  console.error(`❌  No se encontró el instalador NSIS para v${version}.`);
+  process.exit(1);
+}
+console.log(`\n✓  NSIS: ${path.basename(nsisExe)}`);
+if (msiFile) console.log(`✓  MSI:  ${path.basename(msiFile)}`);
+
+// ── Zip + firma (auto o manual) ───────────────────────────────────────────────
+
+let nsisZip = findNewest(nsisDir, f => isVer(f) && f.endsWith(".nsis.zip") && !f.endsWith(".sig"));
+let nsisSig = findNewest(nsisDir, f => isVer(f) && f.endsWith(".nsis.zip.sig"));
+
+if (!nsisZip || !nsisSig) {
+  console.log("\n🔐  El build no firmó automáticamente. Firmando manualmente...");
+
+  // Crear el zip del exe con PowerShell
+  const zipName = path.basename(nsisExe).replace("-setup.exe", "-setup.nsis.zip");
+  nsisZip = path.join(nsisDir, zipName);
+  console.log(`   Comprimiendo ${path.basename(nsisExe)}...`);
+  run(`powershell -Command "Compress-Archive -Path '${nsisExe}' -DestinationPath '${nsisZip}' -Force"`);
+
+  // Firmar el zip con la CLI de Tauri → captura la firma por stdout
+  console.log(`   Firmando ${zipName}...`);
+  const sigContent = capture(`npx tauri signer sign -f "${keyFile}" -p "" "${nsisZip}"`);
+  nsisSig = `${nsisZip}.sig`;
+  fs.writeFileSync(nsisSig, sigContent);
+  console.log("   ✓ Firma generada.");
+}
+
+// ── Tag + push ────────────────────────────────────────────────────────────────
+
 console.log(`\n📌  Creando tag ${tag}...`);
 run(`git tag ${tag}`);
 run("git push origin main");
 run(`git push origin ${tag}`);
 
-// 7. Release en GitHub
+// ── Release ───────────────────────────────────────────────────────────────────
+
 console.log("\n📦  Creando release en GitHub...");
-run(`gh release create ${tag} --title "RoboCopy GUI ${tag}" --notes "Nueva versión ${tag}" --repo ${REPO}`);
+run(`gh release create "${tag}" --title "RoboCopy GUI ${tag}" --notes "Nueva versión ${tag}" --repo ${REPO}`);
 
-// 8. Subir todos los instaladores
-const toUpload = [...nsisExe, ...nsisZip, ...nsisSig, ...msiFile, ...msiZip, ...msiSig].filter(Boolean);
+// ── Subir archivos ────────────────────────────────────────────────────────────
 
-for (const file of toUpload) {
-  console.log(`📤  Subiendo ${path.basename(file)}...`);
-  run(`gh release upload ${tag} "${file}" --repo ${REPO}`);
-}
+const toUpload = [nsisExe, nsisZip, nsisSig, msiFile].filter(Boolean);
+for (const file of toUpload) ghUpload(file);
 
-// 9. Generar latest.json para el auto-updater de Tauri
-const sig     = fs.readFileSync(nsisSig[0], "utf-8").trim();
-const zipName = path.basename(nsisZip[0]);
-const url     = `https://github.com/${REPO}/releases/download/${tag}/${zipName.replace(/ /g, "%20")}`;
+// ── latest.json ───────────────────────────────────────────────────────────────
+
+const sig     = fs.readFileSync(nsisSig, "utf-8").trim();
+const zipBase = path.basename(nsisZip);
+const url     = `https://github.com/${REPO}/releases/download/${tag}/${zipBase.replace(/ /g, "%20")}`;
 
 const latestJson = {
   version,
@@ -115,11 +143,9 @@ const latestJson = {
   },
 };
 
-const latestPath = path.join(__dirname, "../latest.json");
+const latestPath = path.resolve(__dirname, "../latest.json");
 fs.writeFileSync(latestPath, JSON.stringify(latestJson, null, 2));
-
-console.log("📤  Subiendo latest.json...");
-run(`gh release upload ${tag} "${latestPath}" --repo ${REPO}`);
+ghUpload(latestPath);
 
 console.log(`\n✅  Release ${tag} publicado!`);
 console.log(`   https://github.com/${REPO}/releases/tag/${tag}\n`);
