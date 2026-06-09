@@ -58,6 +58,8 @@ export default function App() {
   const [activeTab, setActiveTab]   = useState("explorer");
   const [sourcePath, setSourcePath] = useState("");
   const [destPath, setDestPath]     = useState("");
+  const [sourceFiles, setSourceFiles]     = useState([]);
+  const [sourceFolders, setSourceFolders] = useState([]);
   const [loadedJob, setLoadedJob]   = useState(null);
 
   const [updateInfo, setUpdateInfo] = useState(null);
@@ -170,7 +172,11 @@ export default function App() {
       <main className="flex-1 overflow-hidden">
         <div className={activeTab === "explorer" ? "h-full" : "hidden h-full"}>
           <FileBrowser
-            onSelectSource={setSourcePath}
+            onSelectSource={(path, files, folders) => {
+              setSourcePath(path);
+              setSourceFiles(files || []);
+              setSourceFolders(folders || []);
+            }}
             onSelectDest={setDestPath}
             sourcePath={sourcePath}
             destPath={destPath}
@@ -180,7 +186,9 @@ export default function App() {
           <RobocopyPanel
             source={sourcePath}
             dest={destPath}
-            onSourceChange={setSourcePath}
+            sourceFiles={sourceFiles}
+            sourceFolders={sourceFolders}
+            onSourceChange={path => { setSourcePath(path); setSourceFolders([]); setSourceFiles([]); }}
             onDestChange={setDestPath}
             onGoToExplorer={() => setActiveTab("explorer")}
             loadedJob={loadedJob}

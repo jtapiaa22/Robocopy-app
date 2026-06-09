@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // ─── Iconos SVG inline ───────────────────────────────────────────────────────
 
@@ -89,11 +90,18 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [selected, setSelected] = useState(null); // ruta del ítem seleccionado
+  const [selected, setSelected] = useState(null);
+  const [checkedItems, setCheckedItems] = useState(new Set());
   const listRef = useRef(null);
 
   useEffect(() => {
     loadDrives();
+    const unlistenPromise = listen("drives-changed", (event) => {
+      setDrives(event.payload);
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, []);
 
   async function loadDrives() {
@@ -105,10 +113,21 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
     }
   }
 
+  function toggleCheck(e, entry) {
+    e.stopPropagation();
+    setCheckedItems(prev => {
+      const next = new Set(prev);
+      if (next.has(entry.path)) next.delete(entry.path);
+      else next.add(entry.path);
+      return next;
+    });
+  }
+
   async function navigateTo(path) {
     setLoading(true);
     setError("");
     setSelected(null);
+    setCheckedItems(new Set());
     try {
       const items = await invoke("list_directory", { path });
       setEntries(items);
@@ -127,10 +146,10 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
     if (parent) {
       navigateTo(parent);
     } else {
-      // Estamos en la raíz de un disco: volvemos a la lista de discos
       setCurrentPath("");
       setEntries([]);
       setSelected(null);
+      setCheckedItems(new Set());
     }
   }
 
@@ -169,6 +188,17 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
             {drive.letter}
           </button>
         ))}
+        <button
+          onClick={loadDrives}
+          title="Actualizar discos"
+          className="ml-auto p-1.5 rounded hover:bg-gray-700 text-gray-500 hover:text-gray-300 transition-colors"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
+            <path d="M23 4v6h-6" />
+            <path d="M1 20v-6h6" />
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+          </svg>
+        </button>
       </div>
 
       {/* ── Breadcrumb + botón subir ─────────────────────────────────────── */}
@@ -207,7 +237,8 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
       <div ref={listRef} className="flex-1 overflow-y-auto">
         {/* Cabecera de columnas */}
         {currentPath && (
-          <div className="grid grid-cols-[1fr_100px_100px] gap-2 px-4 py-1.5 text-xs text-gray-600 uppercase tracking-wider border-b border-gray-800 sticky top-0 bg-gray-950">
+          <div className="grid grid-cols-[28px_1fr_100px_100px] gap-2 px-4 py-1.5 text-xs text-gray-600 uppercase tracking-wider border-b border-gray-800 sticky top-0 bg-gray-950">
+            <span />
             <span>Nombre</span>
             <span className="text-right">Tamaño</span>
             <span className="text-right">Modificado</span>
@@ -241,13 +272,23 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
             key={entry.path}
             onClick={() => handleClick(entry)}
             onDoubleClick={() => handleDoubleClick(entry)}
-            className={`grid grid-cols-[1fr_100px_100px] gap-2 items-center px-4 py-2 cursor-pointer
+            className={`grid grid-cols-[28px_1fr_100px_100px] gap-2 items-center px-4 py-2 cursor-pointer
               border-b border-gray-900 select-none transition-colors
-              ${selected === entry.path
-                ? "bg-blue-900/40 border-l-2 border-l-blue-500"
-                : "hover:bg-gray-900"
+              ${checkedItems.has(entry.path)
+                ? "bg-blue-950/50"
+                : selected === entry.path
+                  ? "bg-blue-900/40 border-l-2 border-l-blue-500"
+                  : "hover:bg-gray-900"
               }`}
           >
+            <div className="flex items-center justify-center" onClick={e => e.stopPropagation()}>
+              <input
+                type="checkbox"
+                checked={checkedItems.has(entry.path)}
+                onChange={e => toggleCheck(e, entry)}
+                className="w-3.5 h-3.5 accent-blue-500 cursor-pointer"
+              />
+            </div>
             <div className="flex items-center gap-2.5 min-w-0">
               {entry.is_dir
                 ? <IconFolder className="w-4 h-4 text-yellow-400 shrink-0" />
@@ -272,19 +313,48 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
         {currentFolder ? (
           <>
             <div className="flex-1 min-w-0">
-              <p className="text-xs text-gray-500 truncate" title={currentFolder}>
-                Carpeta actual: <span className="text-gray-300">{currentFolder}</span>
-              </p>
+              {checkedItems.size > 0 ? (
+                <p className="text-xs text-blue-400">
+                  {checkedItems.size} elemento{checkedItems.size !== 1 ? "s" : ""} seleccionado{checkedItems.size !== 1 ? "s" : ""}
+                  <button
+                    onClick={() => setCheckedItems(new Set())}
+                    className="ml-2 text-gray-600 hover:text-gray-400 transition-colors underline"
+                  >
+                    limpiar
+                  </button>
+                </p>
+              ) : (
+                <p className="text-xs text-gray-500 truncate" title={currentFolder}>
+                  Carpeta actual: <span className="text-gray-300">{currentFolder}</span>
+                </p>
+              )}
             </div>
             <button
-              onClick={() => onSelectSource(currentFolder)}
+              onClick={() => {
+                const checked = entries.filter(e => checkedItems.has(e.path));
+                const files   = checked.filter(e => !e.is_dir).map(e => e.name);
+                const folders = checked.filter(e =>  e.is_dir).map(e => e.name);
+                onSelectSource(currentFolder, files, folders);
+              }}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors
                 ${sourcePath === currentFolder
                   ? "bg-emerald-600 text-white"
                   : "bg-emerald-900 hover:bg-emerald-700 text-emerald-300"
                 }`}
             >
-              {sourcePath === currentFolder ? "✓ Origen" : "Usar como Origen"}
+              {sourcePath === currentFolder
+                ? "✓ Origen"
+                : checkedItems.size > 0
+                  ? (() => {
+                      const checked  = entries.filter(e => checkedItems.has(e.path));
+                      const nFolders = checked.filter(e => e.is_dir).length;
+                      const nFiles   = checked.filter(e => !e.is_dir).length;
+                      const parts    = [];
+                      if (nFolders) parts.push(`${nFolders} carp.`);
+                      if (nFiles)   parts.push(`${nFiles} arch.`);
+                      return `Origen (${parts.join(", ")})`;
+                    })()
+                  : "Usar como Origen"}
             </button>
             <button
               onClick={() => onSelectDest(currentFolder)}

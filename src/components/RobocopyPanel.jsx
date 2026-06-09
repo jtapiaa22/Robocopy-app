@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 // ─── Interpreta el exit code de robocopy ────────────────────────────────────
 
@@ -74,7 +75,7 @@ function TagInput({ tags, onChange, placeholder }) {
   }
 
   function handleKey(e) {
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); add(input); }
+    if (e.key === "Enter") { e.preventDefault(); add(input); }
     if (e.key === "Backspace" && !input && tags.length > 0) onChange(tags.slice(0, -1));
   }
 
@@ -147,7 +148,7 @@ function Stat({ label, value, color }) {
 
 // ─── Componente principal ────────────────────────────────────────────────────
 
-export default function RobocopyPanel({ source, dest, onSourceChange, onDestChange, onGoToExplorer, loadedJob }) {
+export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onDestChange, onGoToExplorer, loadedJob }) {
   const [options, setOptions]           = useState({ ...DEFAULT_OPTIONS });
   const [retries, setRetries]           = useState("3");
   const [waitTime, setWaitTime]         = useState("5");
@@ -163,9 +164,18 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
   const [summary, setSummary]           = useState(null);
   const [saveMode, setSaveMode]         = useState(false);
   const [saveName, setSaveName]         = useState("");
+  const [fileCount, setFileCount]       = useState(0);
+  const [multiFolderIdx, setMultiFolderIdx]     = useState(0);
+  const [multiFolderCodes, setMultiFolderCodes] = useState([]);
+  const [showOptions, setShowOptions]           = useState(true);
 
   const outputRef    = useRef(null);
   const unlistenRef  = useRef([]);
+
+  // Cuando el explorador manda archivos seleccionados, pre-rellena el filtro /IF
+  useEffect(() => {
+    if (sourceFiles.length > 0) setFileFilter(sourceFiles);
+  }, [sourceFiles]);
 
   // Carga un trabajo guardado desde el historial
   useEffect(() => {
@@ -220,54 +230,11 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
     }
   }
 
-  async function startRobocopy() {
-    if (!source || !dest) return;
-    setRunning(true);
-    setExitCode(null);
-    setSummary(null);
-    setOutputLines([]);
-
-    unlistenRef.current.forEach(fn => fn());
-    unlistenRef.current = [];
-
-    const ul1 = await listen("robocopy-output", event => {
-      const line = event.payload;
-      setOutputLines(prev => [...prev, line]);
-      parseSummaryLine(line);
-    });
-
-    const ul2 = await listen("robocopy-done", async event => {
-      const code = event.payload;
-      setExitCode(code);
-      setRunning(false);
-      unlistenRef.current.forEach(fn => fn());
-      unlistenRef.current = [];
-
-      // Notificación nativa de Windows
-      try {
-        let granted = await isPermissionGranted();
-        if (!granted) {
-          const req = await requestPermission();
-          granted = req === "granted";
-        }
-        if (granted) {
-          const res = interpretExitCode(code);
-          sendNotification({ title: "RoboCopy GUI", body: `${res.label} — ${res.desc}` });
-        }
-      } catch (_) {}
-    });
-
-    unlistenRef.current = [ul1, ul2];
-
-    // Construye el array de flags
+  function buildFlags() {
     const flags = Object.entries(options)
       .filter(([, on]) => on)
       .map(([flag]) => flag);
-
-    if (mtEnabled) {
-      const t = parseInt(mtThreads, 10);
-      if (!isNaN(t) && t > 0) flags.push(`/MT:${t}`);
-    }
+    if (mtEnabled) { const t = parseInt(mtThreads, 10); if (!isNaN(t) && t > 0) flags.push(`/MT:${t}`); }
     const r = parseInt(retries, 10);
     const w = parseInt(waitTime, 10);
     if (!isNaN(r) && r >= 0) flags.push(`/R:${r}`);
@@ -276,8 +243,102 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
     if (!isNaN(a) && a >= 0) flags.push(`/MAXAGE:${a}`);
     if (excludeFiles.length > 0) flags.push("/XF", ...excludeFiles);
     if (excludeDirs.length  > 0) flags.push("/XD", ...excludeDirs);
-    if (fileFilter.length   > 0) flags.push("/IF", ...fileFilter);
-    flags.push("/NP"); // evita miles de líneas de progreso
+    if (fileFilter.length   > 0 && sourceFolders.length === 0) flags.push("/IF", ...fileFilter);
+    flags.push("/NP");
+    return flags;
+  }
+
+  async function sendDoneNotification(code) {
+    try {
+      let granted = await isPermissionGranted();
+      if (!granted) { const req = await requestPermission(); granted = req === "granted"; }
+      if (granted) {
+        const res = interpretExitCode(code);
+        sendNotification({ title: "RoboCopy GUI", body: `${res.label} — ${res.desc}` });
+      }
+    } catch (_) {}
+  }
+
+  async function startRobocopy() {
+    if (!source || !dest) return;
+    setRunning(true);
+    setExitCode(null);
+    setSummary(null);
+    setOutputLines([]);
+    setFileCount(0);
+    setMultiFolderIdx(0);
+    setMultiFolderCodes([]);
+    setShowOptions(false);
+
+    unlistenRef.current.forEach(fn => fn());
+    unlistenRef.current = [];
+
+    const flags = buildFlags();
+
+    // ── Modo multi-carpeta ──────────────────────────────────────────────────
+    if (sourceFolders.length > 0) {
+      const ul1 = await listen("robocopy-output", event => {
+        const line = event.payload;
+        setOutputLines(prev => [...prev, line]);
+        parseSummaryLine(line);
+        if (/New File|\bNewer\b|\bOlder\b|EXTRA File/i.test(line)) setFileCount(p => p + 1);
+      });
+
+      const ul2 = await listen("robocopy-folder-start", event => {
+        const name = event.payload;
+        setOutputLines(prev => [...prev, "", `${"═".repeat(20)} ${name} ${"═".repeat(20)}`]);
+        setMultiFolderIdx(prev => prev + 1);
+        setFileCount(0);
+      });
+
+      const ul3 = await listen("robocopy-folder-done", event => {
+        setMultiFolderCodes(prev => [...prev, event.payload]);
+      });
+
+      const ul4 = await listen("robocopy-all-done", async event => {
+        const codes = event.payload;
+        const worst = Math.max(...codes);
+        setExitCode(worst);
+        setRunning(false);
+        unlistenRef.current.forEach(fn => fn());
+        unlistenRef.current = [];
+        await sendDoneNotification(worst);
+      });
+
+      unlistenRef.current = [ul1, ul2, ul3, ul4];
+
+      try {
+        await invoke("run_robocopy_multi", {
+          parentSource: source,
+          parentDest: dest,
+          folders: sourceFolders,
+          flags,
+        });
+      } catch (e) {
+        setOutputLines(prev => [...prev, `ERROR: ${e}`]);
+        setRunning(false);
+      }
+      return;
+    }
+
+    // ── Modo carpeta única (comportamiento original) ─────────────────────────
+    const ul1 = await listen("robocopy-output", event => {
+      const line = event.payload;
+      setOutputLines(prev => [...prev, line]);
+      parseSummaryLine(line);
+      if (/New File|\bNewer\b|\bOlder\b|EXTRA File/i.test(line)) setFileCount(p => p + 1);
+    });
+
+    const ul2 = await listen("robocopy-done", async event => {
+      const code = event.payload;
+      setExitCode(code);
+      setRunning(false);
+      unlistenRef.current.forEach(fn => fn());
+      unlistenRef.current = [];
+      await sendDoneNotification(code);
+    });
+
+    unlistenRef.current = [ul1, ul2];
 
     try {
       await invoke("run_robocopy", { source, destination: dest, flags });
@@ -312,15 +373,69 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
     <div className="flex flex-col h-full bg-gray-950 text-gray-100 overflow-hidden">
 
       {/* ── Rutas ──────────────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-4 p-4 bg-gray-900 border-b border-gray-800 shrink-0">
-        <PathField label="Carpeta Origen"  value={source} onChange={onSourceChange}
-          color="emerald" placeholder="C:\ruta\de\origen"  onBrowse={onGoToExplorer} />
-        <PathField label="Carpeta Destino" value={dest}   onChange={onDestChange}
-          color="purple"  placeholder="D:\ruta\de\destino" onBrowse={onGoToExplorer} />
+      <div className="p-4 bg-gray-900 border-b border-gray-800 shrink-0 space-y-3">
+        <div className="grid grid-cols-2 gap-4">
+          <PathField label="Carpeta Origen"  value={source} onChange={onSourceChange}
+            color="emerald" placeholder="C:\ruta\de\origen"  onBrowse={onGoToExplorer} />
+          <PathField label="Carpeta Destino" value={dest}   onChange={onDestChange}
+            color="purple"  placeholder="D:\ruta\de\destino" onBrowse={onGoToExplorer} />
+        </div>
+
+        {/* Badge de carpetas seleccionadas para copia múltiple */}
+        {sourceFolders.length > 0 && (
+          <div className="flex items-start gap-2 px-3 py-2 bg-emerald-950/40 border border-emerald-800/50 rounded-lg">
+            <span className="text-xs text-emerald-400 font-medium shrink-0 mt-0.5">
+              {sourceFolders.length} carpeta{sourceFolders.length !== 1 ? "s" : ""} a copiar:
+            </span>
+            <div className="flex flex-wrap gap-1 flex-1">
+              {sourceFolders.map(f => (
+                <span key={f} className="px-2 py-0.5 bg-emerald-900/60 border border-emerald-700/50 rounded text-xs text-emerald-300 font-mono">
+                  {f}
+                </span>
+              ))}
+            </div>
+            <button
+              onClick={() => onSourceChange(source)}
+              className="text-xs text-emerald-700 hover:text-emerald-500 transition-colors shrink-0"
+              title="Limpiar selección de carpetas"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* ── Cabecera colapsable de opciones ─────────────────────────────────── */}
+      <div
+        onClick={() => setShowOptions(p => !p)}
+        className="flex items-center gap-3 px-4 py-2 bg-gray-900/80 border-b border-gray-800 shrink-0 cursor-pointer hover:bg-gray-900 transition-colors select-none"
+      >
+        <span className="text-xs text-gray-500 uppercase tracking-wider">Opciones</span>
+
+        {/* Resumen compacto cuando está cerrado */}
+        {!showOptions && (
+          <div className="flex items-center gap-1.5 flex-1 flex-wrap">
+            {Object.entries(options).filter(([, v]) => v).map(([flag]) => (
+              <span key={flag} className="px-1.5 py-0.5 bg-blue-950/60 border border-blue-800/50 rounded text-xs text-blue-400 font-mono">{flag}</span>
+            ))}
+            {mtEnabled && <span className="px-1.5 py-0.5 bg-gray-800 rounded text-xs text-gray-400 font-mono">/MT:{mtThreads}</span>}
+            <span className="px-1.5 py-0.5 bg-gray-800 rounded text-xs text-gray-400 font-mono">/R:{retries} /W:{waitTime}</span>
+            {excludeFiles.length > 0 && <span className="text-xs text-gray-600">/XF ({excludeFiles.length})</span>}
+            {excludeDirs.length  > 0 && <span className="text-xs text-gray-600">/XD ({excludeDirs.length})</span>}
+            {fileFilter.length   > 0 && <span className="text-xs text-gray-600">/IF ({fileFilter.length})</span>}
+          </div>
+        )}
+
+        <svg
+          viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+          className={`w-4 h-4 text-gray-600 ml-auto shrink-0 transition-transform duration-200 ${showOptions ? "" : "-rotate-90"}`}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
       </div>
 
       {/* ── Opciones: checkboxes ────────────────────────────────────────────── */}
-      <div className="px-4 pt-3 pb-2 bg-gray-900/60 border-b border-gray-800 shrink-0">
+      {showOptions && <div className="px-4 pt-3 pb-2 bg-gray-900/60 border-b border-gray-800 shrink-0">
         <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Modo de copia</p>
         <div className="grid grid-cols-3 gap-2 lg:grid-cols-6">
           {ROBOCOPY_OPTIONS.map(opt => (
@@ -342,10 +457,10 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
             </label>
           ))}
         </div>
-      </div>
+      </div>}
 
       {/* ── Opciones: campos numéricos y exclusiones ─────────────────────────── */}
-      <div className="px-4 py-3 bg-gray-900/40 border-b border-gray-800 shrink-0">
+      {showOptions && <div className="px-4 py-3 bg-gray-900/40 border-b border-gray-800 shrink-0">
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
 
           {/* Reintentos */}
@@ -403,7 +518,7 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
             <TagInput tags={excludeDirs} onChange={setExcludeDirs} placeholder="node_modules .git ..." />
           </div>
         </div>
-      </div>
+      </div>}
 
       {/* ── Botón de inicio + guardar trabajo ───────────────────────────────── */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-gray-900 border-b border-gray-800 shrink-0">
@@ -417,7 +532,11 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
             className={`flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-colors
               ${isDryRun ? "bg-sky-700 hover:bg-sky-600" : "bg-blue-600 hover:bg-blue-500"}
               disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed`}>
-            {isDryRun ? "🔍 Simular (sin copiar)" : "▶ Iniciar copia"}
+            {isDryRun
+            ? "🔍 Simular (sin copiar)"
+            : sourceFolders.length > 0
+              ? `▶ Copiar ${sourceFolders.length} carpetas`
+              : "▶ Iniciar copia"}
           </button>
         )}
 
@@ -456,6 +575,63 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
           </button>
         </div>
       </div>
+
+      {/* ── Barra de progreso ────────────────────────────────────────────────── */}
+      {(running || exitCode !== null) && (
+        <div className="px-4 py-2.5 bg-gray-900/80 border-b border-gray-800 shrink-0">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs text-gray-400">
+              {running
+                ? sourceFolders.length > 0
+                  ? `Carpeta ${multiFolderIdx} de ${sourceFolders.length}: "${sourceFolders[multiFolderIdx - 1] ?? ""}" — ${fileCount} archivos`
+                  : `${isDryRun ? "Simulando" : "Copiando"}... ${fileCount > 0 ? `${fileCount} archivo${fileCount !== 1 ? "s" : ""} procesado${fileCount !== 1 ? "s" : ""}` : "iniciando"}`
+                : sourceFolders.length > 0
+                  ? `${sourceFolders.length} carpetas — ${multiFolderCodes.filter(c => c >= 8).length === 0 ? "completado" : "con errores"}`
+                  : result?.desc}
+            </span>
+            {!running && exitCode !== null && (
+              <span className={`text-xs font-medium ${result?.color}`}>
+                {exitCode >= 8 ? "✗" : "✓"} código {exitCode}
+              </span>
+            )}
+          </div>
+          <div className="relative h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            {running ? (
+              sourceFolders.length > 0 ? (
+                // Progreso escalonado por carpeta
+                <div
+                  className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                  style={{ width: `${(multiFolderIdx / sourceFolders.length) * 100}%` }}
+                />
+              ) : (
+                // Shimmer para copia única
+                <div className="absolute inset-y-0 left-0 w-1/4 bg-gradient-to-r from-transparent via-blue-400 to-transparent motion-safe:animate-shimmer" />
+              )
+            ) : (
+              <div className={`h-full w-full rounded-full transition-all duration-300 ${
+                exitCode >= 8 ? "bg-red-500" : exitCode === 0 ? "bg-gray-500" : "bg-emerald-500"
+              }`} />
+            )}
+          </div>
+
+          {/* Resumen por carpeta al terminar */}
+          {!running && sourceFolders.length > 0 && multiFolderCodes.length > 0 && (
+            <div className="flex flex-wrap gap-2 mt-2">
+              {sourceFolders.map((name, i) => {
+                const code = multiFolderCodes[i];
+                const ok   = code !== undefined && code < 8;
+                return (
+                  <span key={name} className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono border
+                    ${ok ? "bg-emerald-950/50 border-emerald-800 text-emerald-400"
+                         : "bg-red-950/50 border-red-800 text-red-400"}`}>
+                    {ok ? "✓" : "✗"} {name}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Output ──────────────────────────────────────────────────────────── */}
       <div ref={outputRef} className="flex-1 overflow-y-auto bg-gray-950">
@@ -501,6 +677,14 @@ export default function RobocopyPanel({ source, dest, onSourceChange, onDestChan
 function PathField({ label, value, onChange, color, placeholder, onBrowse }) {
   const focusColor = color === "emerald" ? "focus:border-emerald-500" : "focus:border-purple-500";
   const textColor  = color === "emerald" ? "text-emerald-500" : "text-purple-500";
+
+  async function handleNativeDialog() {
+    try {
+      const selected = await openDialog({ directory: true, multiple: false, title: label });
+      if (selected) onChange(selected);
+    } catch (_) {}
+  }
+
   return (
     <div>
       <label className="block text-xs text-gray-500 uppercase tracking-wider mb-1.5">{label}</label>
@@ -508,7 +692,11 @@ function PathField({ label, value, onChange, color, placeholder, onBrowse }) {
         <input type="text" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
           className={`selectable flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm
             text-gray-200 placeholder-gray-600 focus:outline-none ${focusColor}`} />
-        <button onClick={onBrowse} title="Explorar"
+        <button onClick={handleNativeDialog} title="Seleccionar con explorador de Windows"
+          className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-400 transition-colors text-base">
+          🗂
+        </button>
+        <button onClick={onBrowse} title="Explorar en la app (con selección de archivos)"
           className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-400 transition-colors">
           📂
         </button>

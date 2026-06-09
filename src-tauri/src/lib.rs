@@ -17,7 +17,7 @@ struct FileEntry {
     extension: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, PartialEq)]
 struct DriveInfo {
     letter: String,
     root: String,
@@ -59,8 +59,7 @@ fn write_jobs(app: &tauri::AppHandle, jobs: &[CopyJob]) -> Result<(), String> {
 
 // ─── Comandos: explorador ────────────────────────────────────────────────────
 
-#[tauri::command]
-fn list_drives() -> Vec<DriveInfo> {
+fn get_drives() -> Vec<DriveInfo> {
     (b'A'..=b'Z')
         .filter_map(|letter| {
             let root = format!("{}:\\", letter as char);
@@ -74,6 +73,11 @@ fn list_drives() -> Vec<DriveInfo> {
             }
         })
         .collect()
+}
+
+#[tauri::command]
+fn list_drives() -> Vec<DriveInfo> {
+    get_drives()
 }
 
 #[tauri::command]
@@ -188,6 +192,53 @@ fn delete_job(app: tauri::AppHandle, id: String) -> Result<(), String> {
     write_jobs(&app, &jobs)
 }
 
+// Corre Robocopy una vez por cada subcarpeta seleccionada
+#[tauri::command]
+async fn run_robocopy_multi(
+    app: tauri::AppHandle,
+    parent_source: String,
+    parent_dest: String,
+    folders: Vec<String>,
+    flags: Vec<String>,
+) -> Result<Vec<i32>, String> {
+    let mut codes: Vec<i32> = vec![];
+
+    for folder in &folders {
+        let src = format!("{}\\{}", parent_source, folder);
+        let dst = format!("{}\\{}", parent_dest, folder);
+
+        let _ = app.emit("robocopy-folder-start", folder.clone());
+
+        let mut cmd = Command::new("robocopy");
+        cmd.arg(&src)
+            .arg(&dst)
+            .args(&flags)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let stdout = child.stdout.take().ok_or("No stdout")?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = app.emit("robocopy-output", &line);
+        }
+
+        let code = child.wait().await.map_err(|e| e.to_string())?.code().unwrap_or(-1);
+        codes.push(code);
+        let _ = app.emit("robocopy-folder-done", code);
+    }
+
+    let _ = app.emit("robocopy-all-done", &codes);
+    Ok(codes)
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -197,11 +248,28 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut last = get_drives();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let current = get_drives();
+                    if current != last {
+                        last = current.clone();
+                        let _ = handle.emit("drives-changed", &last);
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_drives,
             list_directory,
             get_parent_path,
             run_robocopy,
+            run_robocopy_multi,
             save_job,
             load_jobs,
             delete_job,
