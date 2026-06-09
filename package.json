@@ -10,7 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "publish": "node scripts/publish.js"
+    "publish": "node scripts/publish.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
