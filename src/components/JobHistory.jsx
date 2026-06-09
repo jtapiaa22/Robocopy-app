@@ -36,14 +36,14 @@ function buildCommand(job) {
   return `robocopy "${job.source}" "${job.destination}" ${flags.join(" ")}`;
 }
 
-export default function JobHistory({ onLoadJob }) {
+export default function JobHistory({ onLoadJob, jobsVersion }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [copiedId, setCopiedId] = useState(null);
 
   useEffect(() => {
     loadJobs();
-  }, []);
+  }, [jobsVersion]);
 
   async function loadJobs() {
     setLoading(true);

@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, BufReader};
+// AsyncReadExt se importa dentro de stream_output para no contaminar el scope global
 use tokio::process::Command;
 
 struct ProcessState {
@@ -137,6 +137,56 @@ fn get_parent_path(path: String) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ─── Helper: stream stdout de robocopy, diferenciando \r (progreso) y \r\n ───
+
+async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildStdout) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut prev_cr = false;
+
+    loop {
+        let n = match stdout.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for &byte in &buf[..n] {
+            if prev_cr {
+                if byte == b'\n' {
+                    // \r\n → línea completa (append)
+                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    let _ = app.emit("robocopy-output", &line);
+                    pending.clear();
+                    prev_cr = false;
+                    continue;
+                } else {
+                    // \r solo → porcentaje en curso (reemplaza última línea)
+                    if !pending.is_empty() {
+                        let line = String::from_utf8_lossy(&pending).into_owned();
+                        let _ = app.emit("robocopy-output-cr", &line);
+                        pending.clear();
+                    }
+                    prev_cr = false;
+                }
+            }
+            match byte {
+                b'\r' => { prev_cr = true; }
+                b'\n' => {
+                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    let _ = app.emit("robocopy-output", &line);
+                    pending.clear();
+                }
+                _ => { pending.push(byte); }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).into_owned();
+        let _ = app.emit("robocopy-output", &line);
+    }
+}
+
 // ─── Comandos: robocopy ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -167,11 +217,7 @@ async fn run_robocopy(
     *state.pid.lock().unwrap() = child.id();
 
     let stdout = child.stdout.take().ok_or("No se pudo capturar stdout")?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        let _ = app.emit("robocopy-output", &line);
-    }
+    stream_output(app.clone(), stdout).await;
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
     *state.pid.lock().unwrap() = None;
@@ -244,11 +290,7 @@ async fn run_robocopy_multi(
         *state.pid.lock().unwrap() = child.id();
 
         let stdout = child.stdout.take().ok_or("No stdout")?;
-        let mut lines = BufReader::new(stdout).lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = app.emit("robocopy-output", &line);
-        }
+        stream_output(app.clone(), stdout).await;
 
         let code = child.wait().await.map_err(|e| e.to_string())?.code().unwrap_or(-1);
         *state.pid.lock().unwrap() = None;

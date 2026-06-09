@@ -61,6 +61,7 @@ export default function App() {
   const [sourceFiles, setSourceFiles]     = useState([]);
   const [sourceFolders, setSourceFolders] = useState([]);
   const [loadedJob, setLoadedJob]   = useState(null);
+  const [jobsVersion, setJobsVersion] = useState(0);
 
   const [updateInfo, setUpdateInfo] = useState(null);
   const [updating, setUpdating]     = useState(false);
@@ -192,10 +193,11 @@ export default function App() {
             onDestChange={setDestPath}
             onGoToExplorer={() => setActiveTab("explorer")}
             loadedJob={loadedJob}
+            onJobSaved={() => setJobsVersion(v => v + 1)}
           />
         </div>
         <div className={activeTab === "history" ? "h-full" : "hidden h-full"}>
-          <JobHistory onLoadJob={handleLoadJob} />
+          <JobHistory onLoadJob={handleLoadJob} jobsVersion={jobsVersion} />
         </div>
         <div className={activeTab === "help" ? "h-full" : "hidden h-full"}>
           <HelpPanel />
