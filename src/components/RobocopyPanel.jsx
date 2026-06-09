@@ -209,7 +209,7 @@ function Stat({ label, value, color }) {
 
 // ─── Componente principal ────────────────────────────────────────────────────
 
-export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onDestChange, onGoToExplorer, loadedJob, onJobSaved }) {
+export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onDestChange, onGoToExplorer, loadedJob, onJobSaved, onStatusChange }) {
   const [options, setOptions]           = useState({ ...DEFAULT_OPTIONS });
   const [retries, setRetries]           = useState("3");
   const [waitTime, setWaitTime]         = useState("5");
@@ -266,6 +266,12 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   useEffect(() => {
     if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
   }, [outputLines]);
+
+  // Reporta estado de copia al componente padre (para la barra en segundo plano)
+  useEffect(() => {
+    const ft = liveFile ? getFileType(liveFile.ext) : null;
+    onStatusChange?.({ running, liveFile, ft, fileCount });
+  }, [running, liveFile, fileCount]);
 
   // Limpia listeners al desmontar
   useEffect(() => () => unlistenRef.current.forEach(fn => fn()), []);

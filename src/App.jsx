@@ -62,6 +62,7 @@ export default function App() {
   const [sourceFolders, setSourceFolders] = useState([]);
   const [loadedJob, setLoadedJob]   = useState(null);
   const [jobsVersion, setJobsVersion] = useState(0);
+  const [copyStatus, setCopyStatus] = useState({ running: false, liveFile: null, ft: null, fileCount: 0 });
 
   const [updateInfo, setUpdateInfo] = useState(null);
   const [updating, setUpdating]     = useState(false);
@@ -161,13 +162,74 @@ export default function App() {
                 : "border-transparent text-gray-500 hover:text-gray-300 hover:bg-gray-800/50"}`}>
             {tab.icon}
             {tab.label}
-            {/* Badge en Robocopy cuando hay rutas cargadas */}
-            {tab.id === "robocopy" && (sourcePath || destPath) && (
+            {/* Badge pulsante cuando hay copia corriendo */}
+            {tab.id === "robocopy" && copyStatus.running ? (
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+              </span>
+            ) : tab.id === "robocopy" && (sourcePath || destPath) ? (
               <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
-            )}
+            ) : null}
           </button>
         ))}
       </nav>
+
+      {/* ── Barra de progreso en segundo plano (visible en otras pestañas) ───── */}
+      {copyStatus.running && activeTab !== "robocopy" && (
+        <button
+          onClick={() => setActiveTab("robocopy")}
+          className="flex items-center gap-3 px-4 py-2 bg-blue-950/70 border-b border-blue-900/50 text-xs w-full hover:bg-blue-950/90 transition-colors shrink-0 group"
+        >
+          {/* Indicador pulsante */}
+          <span className="relative flex h-2 w-2 shrink-0">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+          </span>
+
+          <span className="text-blue-400 font-medium shrink-0">Copiando en segundo plano</span>
+
+          {copyStatus.liveFile?.name ? (
+            <>
+              {/* Badge del tipo de archivo */}
+              {copyStatus.ft && (
+                <span className={`${copyStatus.ft.bg} ${copyStatus.ft.fg} px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shrink-0`}>
+                  {copyStatus.ft.short}
+                </span>
+              )}
+              {/* Nombre */}
+              <span className="text-gray-300 truncate max-w-[220px]">{copyStatus.liveFile.name}</span>
+              {/* Directorio */}
+              {copyStatus.liveFile.dir && (
+                <span className="text-gray-600 truncate max-w-[180px] font-mono hidden lg:block">
+                  {copyStatus.liveFile.dir}
+                </span>
+              )}
+              {/* Barra + porcentaje */}
+              <div className="flex items-center gap-2 ml-auto shrink-0">
+                <div className="relative h-1 w-28 bg-blue-900/60 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full ${copyStatus.ft?.bar ?? "bg-blue-500"} rounded-full transition-all duration-300`}
+                    style={{ width: `${copyStatus.liveFile.percent || 0}%` }}
+                  />
+                </div>
+                <span className="text-blue-300 font-mono w-8 text-right tabular-nums">
+                  {copyStatus.liveFile.percent > 0 ? `${copyStatus.liveFile.percent}%` : "—"}
+                </span>
+              </div>
+            </>
+          ) : (
+            <span className="text-gray-500">
+              {copyStatus.fileCount > 0 ? `${copyStatus.fileCount} archivo${copyStatus.fileCount !== 1 ? "s" : ""} procesado${copyStatus.fileCount !== 1 ? "s" : ""}` : "Iniciando..."}
+            </span>
+          )}
+
+          {/* Hint "ir a ver" */}
+          <span className="text-blue-700 group-hover:text-blue-500 transition-colors shrink-0 ml-1">
+            Ver detalles →
+          </span>
+        </button>
+      )}
 
       {/* ── Contenido ────────────────────────────────────────────────────────── */}
       <main className="flex-1 overflow-hidden">
@@ -194,6 +256,7 @@ export default function App() {
             onGoToExplorer={() => setActiveTab("explorer")}
             loadedJob={loadedJob}
             onJobSaved={() => setJobsVersion(v => v + 1)}
+            onStatusChange={setCopyStatus}
           />
         </div>
         <div className={activeTab === "history" ? "h-full" : "hidden h-full"}>
