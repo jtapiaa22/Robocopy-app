@@ -14,9 +14,10 @@ dist-ssr
 .claude
 .vscode
 
-# Claves de firma (NUNCA subir al repo)
+# Claves de firma y artefactos generados (NUNCA subir al repo)
 .tauri-signing-key
 .tauri-signing-key.pub
+latest.json
 
 # Editor directories and files
 .vscode/*
