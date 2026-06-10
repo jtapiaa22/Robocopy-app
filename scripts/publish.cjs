@@ -103,11 +103,14 @@ if (!nsisZip || !nsisSig) {
   console.log(`   Comprimiendo ${path.basename(nsisExe)}...`);
   run(`powershell -Command "Compress-Archive -Path '${nsisExe}' -DestinationPath '${nsisZip}' -Force"`);
 
-  // Firmar el zip con la CLI de Tauri → captura la firma por stdout
+  // Firmar el zip con la CLI de Tauri (crea el .sig automáticamente al lado del zip)
   console.log(`   Firmando ${zipName}...`);
-  const sigContent = capture(`npx tauri signer sign -f "${keyFile}" -p "" "${nsisZip}"`);
+  run(`npx tauri signer sign -f "${keyFile}" -p "" "${nsisZip}"`);
   nsisSig = `${nsisZip}.sig`;
-  fs.writeFileSync(nsisSig, sigContent);
+  if (!fs.existsSync(nsisSig)) {
+    console.error("❌  No se encontró el archivo .sig después de firmar.");
+    process.exit(1);
+  }
   console.log("   ✓ Firma generada.");
 }
 
