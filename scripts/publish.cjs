@@ -34,6 +34,75 @@ function ghUpload(file) {
   run(`gh release upload "${tag}" "${file}" --repo ${REPO}`);
 }
 
+// Crea un ZIP con método STORED (método 0) en puro Node.js.
+// El crate zip de Rust soporta STORED incondicionalmente, sin importar qué features tenga compiladas.
+function createStoredZip(zipPath, filePath) {
+  const name = path.basename(filePath);
+  const data = fs.readFileSync(filePath);
+  const size = data.length;
+  const nameLen = Buffer.byteLength(name, "utf8");
+
+  // CRC-32
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < size; i++) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  crc = (crc ^ 0xffffffff) >>> 0;
+
+  // Local file header
+  const lh = Buffer.alloc(30 + nameLen);
+  lh.writeUInt32LE(0x04034b50, 0);
+  lh.writeUInt16LE(20, 4);
+  lh.writeUInt16LE(0,  6);
+  lh.writeUInt16LE(0,  8);   // compression: STORED
+  lh.writeUInt16LE(0, 10);
+  lh.writeUInt16LE(0, 12);
+  lh.writeUInt32LE(crc,  14);
+  lh.writeUInt32LE(size, 18);
+  lh.writeUInt32LE(size, 22);
+  lh.writeUInt16LE(nameLen, 26);
+  lh.writeUInt16LE(0, 28);
+  lh.write(name, 30, "utf8");
+
+  // Central directory record
+  const cd = Buffer.alloc(46 + nameLen);
+  cd.writeUInt32LE(0x02014b50, 0);
+  cd.writeUInt16LE(20, 4);
+  cd.writeUInt16LE(20, 6);
+  cd.writeUInt16LE(0,  8);
+  cd.writeUInt16LE(0, 10);   // compression: STORED
+  cd.writeUInt16LE(0, 12);
+  cd.writeUInt16LE(0, 14);
+  cd.writeUInt32LE(crc,  16);
+  cd.writeUInt32LE(size, 20);
+  cd.writeUInt32LE(size, 24);
+  cd.writeUInt16LE(nameLen, 28);
+  cd.writeUInt16LE(0, 30);
+  cd.writeUInt16LE(0, 32);
+  cd.writeUInt16LE(0, 34);
+  cd.writeUInt16LE(0, 36);
+  cd.writeUInt32LE(0, 38);
+  cd.writeUInt32LE(0, 42);   // local header offset = 0
+  cd.write(name, 46, "utf8");
+
+  // End of central directory record
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(46 + nameLen,        12);  // cd size
+  eocd.writeUInt32LE(30 + nameLen + size, 16);  // cd offset
+  eocd.writeUInt16LE(0, 20);
+
+  fs.writeFileSync(zipPath, Buffer.concat([lh, data, cd, eocd]));
+}
+
 // ── Validaciones ──────────────────────────────────────────────────────────────
 
 console.log(`\n🚀  RoboCopy GUI ${tag} — build local + publish\n`);
@@ -98,25 +167,11 @@ let nsisSig = findNewest(nsisDir, f => isVer(f) && f.endsWith(".nsis.zip.sig"));
 if (!nsisZip || !nsisSig) {
   console.log("\n🔐  El build no firmó automáticamente. Firmando manualmente...");
 
-  // Crear el zip con .NET ZipFile (Deflate estándar, compatible con el crate zip de Tauri)
   const zipName = path.basename(nsisExe).replace("-setup.exe", "-setup.nsis.zip");
   nsisZip = path.join(nsisDir, zipName);
   console.log(`   Comprimiendo ${path.basename(nsisExe)}...`);
-  const exeName = path.basename(nsisExe);
-  const psContent = [
-    "Add-Type -AssemblyName System.IO.Compression",
-    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
-    `$z = [System.IO.Compression.ZipFile]::Open("${nsisZip}", [System.IO.Compression.ZipArchiveMode]::Create)`,
-    `[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, "${nsisExe}", "${exeName}", [System.IO.Compression.CompressionLevel]::Optimal)`,
-    "$z.Dispose()",
-  ].join("\n");
-  const tmpPs1 = path.join(nsisDir, "_zip.ps1");
-  fs.writeFileSync(tmpPs1, psContent, "utf-8");
-  try {
-    run(`powershell -ExecutionPolicy Bypass -NoProfile -File "${tmpPs1}"`);
-  } finally {
-    try { fs.unlinkSync(tmpPs1); } catch (_) {}
-  }
+  createStoredZip(nsisZip, nsisExe);
+  console.log(`   ✓ ZIP creado (STORED).`);
 
   // Firmar el zip con la CLI de Tauri (crea el .sig automáticamente al lado del zip)
   console.log(`   Firmando ${zipName}...`);
