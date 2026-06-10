@@ -1,7 +1,7 @@
 {
   "name": "robocopy-app",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "Sistema de copia de archivos utilizando Robocopy, desarrollado con React, Tailwind CSS y Tauri.",
   "author": "TADevStudio",
   "type": "module",
@@ -10,7 +10,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "publish": "node scripts/publish.cjs"
+    "publish": "node scripts/publish.cjs",
+    "act_version": "node scripts/bump.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
