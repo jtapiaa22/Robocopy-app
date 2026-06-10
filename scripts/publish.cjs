@@ -97,11 +97,24 @@ let nsisSig = findNewest(nsisDir, f => isVer(f) && f.endsWith(".nsis.zip.sig"));
 if (!nsisZip || !nsisSig) {
   console.log("\n🔐  El build no firmó automáticamente. Firmando manualmente...");
 
-  // Crear el zip del exe con PowerShell
+  // Crear el zip con .NET ZipFile (Deflate estándar, compatible con el crate zip de Tauri)
   const zipName = path.basename(nsisExe).replace("-setup.exe", "-setup.nsis.zip");
   nsisZip = path.join(nsisDir, zipName);
   console.log(`   Comprimiendo ${path.basename(nsisExe)}...`);
-  run(`powershell -Command "Compress-Archive -Path '${nsisExe}' -DestinationPath '${nsisZip}' -Force"`);
+  const exeName = path.basename(nsisExe);
+  const psContent = [
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `$z = [System.IO.Compression.ZipFile]::Open("${nsisZip}", [System.IO.Compression.ZipArchiveMode]::Create)`,
+    `[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, "${nsisExe}", "${exeName}", [System.IO.Compression.CompressionLevel]::Optimal)`,
+    "$z.Dispose()",
+  ].join("\n");
+  const tmpPs1 = path.join(nsisDir, "_zip.ps1");
+  fs.writeFileSync(tmpPs1, psContent, "utf-8");
+  try {
+    run(`powershell -ExecutionPolicy Bypass -NoProfile -File "${tmpPs1}"`);
+  } finally {
+    try { fs.unlinkSync(tmpPs1); } catch (_) {}
+  }
 
   // Firmar el zip con la CLI de Tauri (crea el .sig automáticamente al lado del zip)
   console.log(`   Firmando ${zipName}...`);
