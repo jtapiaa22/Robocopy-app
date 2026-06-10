@@ -5,6 +5,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 export default function Actualizador() {
   const [verificando, setVerificando] = useState(false)
   const [descargando, setDescargando] = useState(false)
+  const [instalando, setInstalando] = useState(false)
   const [progreso, setProgreso] = useState(0)
   const [alerta, setAlerta] = useState(null)
   const [confirmar, setConfirmar] = useState(null)
@@ -20,25 +21,31 @@ export default function Actualizador() {
           onConfirmar: async () => {
             setConfirmar(null)
             setDescargando(true)
+            setInstalando(false)
             setProgreso(0)
 
-            let downloaded = 0
-            let total = 0
+            try {
+              let downloaded = 0
+              let total = 0
 
-            await update.downloadAndInstall((event) => {
-              if (event.event === 'Started') {
-                total = event.data.contentLength ?? 0
-              } else if (event.event === 'Progress') {
-                downloaded += event.data.chunkLength ?? 0
-                if (total > 0) setProgreso(Math.floor((downloaded / total) * 100))
-              } else if (event.event === 'Finished') {
-                setProgreso(100)
-              }
-            })
+              await update.downloadAndInstall((event) => {
+                if (event.event === 'Started') {
+                  total = event.data.contentLength ?? 0
+                } else if (event.event === 'Progress') {
+                  downloaded += event.data.chunkLength ?? 0
+                  if (total > 0) setProgreso(Math.floor((downloaded / total) * 100))
+                } else if (event.event === 'Finished') {
+                  setProgreso(100)
+                  setInstalando(true)
+                }
+              })
 
-            setDescargando(false)
-            setAlerta({ tipo: 'success', mensaje: 'La app se reiniciará automáticamente para instalar la actualización.' })
-            await relaunch()
+              await relaunch()
+            } catch (err) {
+              setDescargando(false)
+              setInstalando(false)
+              setAlerta({ tipo: 'error', mensaje: `Error al instalar la actualización: ${String(err)}` })
+            }
           },
         })
       } else {
@@ -51,7 +58,7 @@ export default function Actualizador() {
     }
   }
 
-  const ocupado = verificando || descargando
+  const ocupado = verificando || descargando || instalando
 
   return (
     <>
@@ -92,15 +99,15 @@ export default function Actualizador() {
       )}
 
       <div className="w-full">
-        {descargando && (
+        {(descargando || instalando) && (
           <div className="mb-3">
             <div className="flex justify-between text-xs text-gray-500 mb-1.5">
-              <span>Descargando actualización...</span>
+              <span>{instalando ? 'Instalando...' : 'Descargando actualización...'}</span>
               <span>{progreso}%</span>
             </div>
             <div className="w-full h-1.5 bg-gray-800 rounded-full overflow-hidden">
               <div
-                className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                className={`h-full rounded-full transition-all duration-300 ${instalando ? 'bg-emerald-500 animate-pulse' : 'bg-blue-500'}`}
                 style={{ width: `${progreso}%` }}
               />
             </div>
@@ -117,11 +124,13 @@ export default function Actualizador() {
               <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
             </svg>
           )}
-          {descargando
-            ? `Descargando... ${progreso}%`
-            : verificando
-              ? 'Verificando actualizaciones...'
-              : 'Buscar actualizaciones'}
+          {instalando
+            ? 'Instalando...'
+            : descargando
+              ? `Descargando... ${progreso}%`
+              : verificando
+                ? 'Verificando actualizaciones...'
+                : 'Buscar actualizaciones'}
         </button>
       </div>
     </>
