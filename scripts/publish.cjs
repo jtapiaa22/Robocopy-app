@@ -105,7 +105,7 @@ if (!nsisZip || !nsisSig) {
 
   // Firmar el zip con la CLI de Tauri (crea el .sig automáticamente al lado del zip)
   console.log(`   Firmando ${zipName}...`);
-  run(`npx tauri signer sign -f "${keyFile}" -p "" "${nsisZip}"`);
+  execSync(`npx tauri signer sign -f "${keyFile}" -p "" "${nsisZip}"`, { stdio: ["inherit", "ignore", "inherit"] });
   nsisSig = `${nsisZip}.sig`;
   if (!fs.existsSync(nsisSig)) {
     console.error("❌  No se encontró el archivo .sig después de firmar.");
