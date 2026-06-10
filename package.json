@@ -1,7 +1,7 @@
 {
   "name": "robocopy-app",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.6",
   "description": "Sistema de copia de archivos utilizando Robocopy, desarrollado con React, Tailwind CSS y Tauri.",
   "author": "TADevStudio",
   "type": "module",

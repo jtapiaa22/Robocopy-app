@@ -7,6 +7,38 @@ use tauri::{Emitter, Manager};
 // AsyncReadExt se importa dentro de stream_output para no contaminar el scope global
 use tokio::process::Command;
 
+// ─── Decodificación de salida CMD (OEM code page) ────────────────────────────
+
+// Robocopy emite texto usando el code page OEM del sistema (ej. CP850 en español).
+// String::from_utf8_lossy no es suficiente: los acentos aparecen como símbolos raros.
+// Usamos MultiByteToWideChar con CP_OEMCP para decodificar correctamente en cualquier locale.
+#[cfg(target_os = "windows")]
+fn decode_cmd_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
+    let len = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0)
+    };
+    if len <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; len as usize];
+    unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), len);
+    }
+    String::from_utf16_lossy(&wide)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_cmd_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 struct ProcessState {
     pid: Mutex<Option<u32>>,
     cancelled: AtomicBool,
@@ -155,7 +187,7 @@ async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildS
             if prev_cr {
                 if byte == b'\n' {
                     // \r\n → línea completa (append)
-                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    let line = decode_cmd_output(&pending);
                     let _ = app.emit("robocopy-output", &line);
                     pending.clear();
                     prev_cr = false;
@@ -163,7 +195,7 @@ async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildS
                 } else {
                     // \r solo → porcentaje en curso (reemplaza última línea)
                     if !pending.is_empty() {
-                        let line = String::from_utf8_lossy(&pending).into_owned();
+                        let line = decode_cmd_output(&pending);
                         let _ = app.emit("robocopy-output-cr", &line);
                         pending.clear();
                     }
@@ -173,7 +205,7 @@ async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildS
             match byte {
                 b'\r' => { prev_cr = true; }
                 b'\n' => {
-                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    let line = decode_cmd_output(&pending);
                     let _ = app.emit("robocopy-output", &line);
                     pending.clear();
                 }
@@ -182,7 +214,7 @@ async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildS
         }
     }
     if !pending.is_empty() {
-        let line = String::from_utf8_lossy(&pending).into_owned();
+        let line = decode_cmd_output(&pending);
         let _ = app.emit("robocopy-output", &line);
     }
 }
@@ -206,7 +238,8 @@ async fn run_robocopy(
     #[cfg(target_os = "windows")]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
@@ -283,7 +316,8 @@ async fn run_robocopy_multi(
         #[cfg(target_os = "windows")]
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
@@ -300,6 +334,22 @@ async fn run_robocopy_multi(
 
     let _ = app.emit("robocopy-all-done", &codes);
     Ok(codes)
+}
+
+// Envía CTRL_BREAK_EVENT al proceso de Robocopy para desbloquearlo sin matarlo.
+// Equivalente a presionar Ctrl+C una vez en CMD: interrumpe una espera de I/O atascada
+// y permite que Robocopy reintente la operación y continúe.
+#[tauri::command]
+fn nudge_robocopy(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<ProcessState>();
+    if let Some(pid) = *state.pid.lock().unwrap() {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -351,6 +401,7 @@ pub fn run() {
             get_parent_path,
             run_robocopy,
             run_robocopy_multi,
+            nudge_robocopy,
             cancel_robocopy,
             save_job,
             load_jobs,

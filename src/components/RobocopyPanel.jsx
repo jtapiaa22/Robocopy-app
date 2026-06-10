@@ -88,10 +88,17 @@ function parseFileLine(line) {
 }
 
 function parseDirLine(line) {
-  // Detecta líneas de directorio: "\t   3\tE:\source\subfolder\"
-  const segs = line.split("\t").map(s => s.trim()).filter(Boolean);
-  const last = segs[segs.length - 1];
-  return (last && /^[A-Za-z]:[/\\]/.test(last) && last.endsWith("\\")) ? last : null;
+  // Robocopy muestra: "[espacios]Nuevo dir[espacios]N[espacios]LETRA:\ruta\"
+  // Los separadores pueden ser espacios o tabs, así que usamos regex en lugar de split.
+  const pathMatch = line.match(/([A-Za-z]:[/\\].+[/\\])\s*$/);
+  if (!pathMatch) return null;
+  const path = pathMatch[1];
+  // Descarta líneas de cabecera como "Source : C:\..." o "Dest : D:\..."
+  const before = line.slice(0, pathMatch.index);
+  if (before.includes(":")) return null;
+  // Extrae el número entero justo antes de la ruta (cantidad de elementos en el directorio)
+  const numMatch = before.match(/(\d+)\s*$/);
+  return { path, count: numMatch ? parseInt(numMatch[1], 10) : null };
 }
 
 function getFileDescription(ext) {
@@ -229,9 +236,12 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [multiFolderIdx, setMultiFolderIdx]     = useState(0);
   const [multiFolderCodes, setMultiFolderCodes] = useState([]);
   const [showOptions, setShowOptions]           = useState(true);
-  const [liveFile, setLiveFile]       = useState(null);  // { name, ext, size, percent }
-  const [recentFiles, setRecentFiles] = useState([]);    // archivos recién copiados
-  const [showRawLog, setShowRawLog]   = useState(false);
+  const [liveFile, setLiveFile]           = useState(null);  // { name, ext, size, percent }
+  const [recentFiles, setRecentFiles]     = useState([]);    // archivos recién copiados
+  const [showRawLog, setShowRawLog]       = useState(false);
+  const [currentDirInfo, setCurrentDirInfo] = useState(null); // { path, count, processed }
+  const [cancelling, setCancelling]       = useState(false);
+  const [nudgeFeedback, setNudgeFeedback] = useState(false); // feedback visual tras "desbloquear"
 
   const outputRef    = useRef(null);
   const unlistenRef  = useRef([]);
@@ -347,6 +357,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     setLiveFile(null);
     setRecentFiles([]);
     setShowRawLog(false);
+    setCurrentDirInfo(null);
+    setCancelling(false);
     currentDirRef.current = "";
 
     const flags = buildFlags();
@@ -363,13 +375,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         });
         parseSummaryLine(line);
         // Detectar directorio actual
-        const dir = parseDirLine(line);
-        if (dir) { currentDirRef.current = dir; }
-        if (/New File|\bNewer\b|\bOlder\b|EXTRA File/i.test(line)) {
+        const dirInfo = parseDirLine(line);
+        if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
+        if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
           setFileCount(p => p + 1);
+          setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
           const parsed = parseFileLine(line);
           if (parsed?.name) {
-            setLiveFile(null);
+            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
             setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
           }
         }
@@ -386,7 +399,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         const pctMatch = line.trim().match(/^(\d+)%/);
         if (pctMatch) {
           const pct = parseInt(pctMatch[1], 10);
-          setLiveFile(prev => ({ name: prev?.name || "", ext: prev?.ext || "", size: prev?.size || "", dir: prev?.dir || currentDirRef.current, percent: pct }));
+          setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
         } else {
           const parsed = parseFileLine(line);
           if (parsed?.name) setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
@@ -397,6 +410,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         const name = event.payload;
         lastWasCrRef.current = false;
         currentDirRef.current = "";
+        setCurrentDirInfo(null);
         setOutputLines(prev => [...prev, "", `${"═".repeat(20)} ${name} ${"═".repeat(20)}`]);
         setMultiFolderIdx(prev => prev + 1);
         setFileCount(0);
@@ -414,6 +428,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         setExitCode(worst);
         setRunning(false);
         setLiveFile(null);
+        setCurrentDirInfo(null);
+        setCancelling(false);
         unlistenRef.current.forEach(fn => fn());
         unlistenRef.current = [];
         await sendDoneNotification(worst);
@@ -445,13 +461,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         return [...prev, line];
       });
       parseSummaryLine(line);
-      const dir = parseDirLine(line);
-      if (dir) { currentDirRef.current = dir; }
-      if (/New File|\bNewer\b|\bOlder\b|EXTRA File/i.test(line)) {
+      const dirInfo = parseDirLine(line);
+      if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
+      if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
         setFileCount(p => p + 1);
+        setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
         const parsed = parseFileLine(line);
         if (parsed?.name) {
-          setLiveFile(null);
+          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
           setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
         }
       }
@@ -468,7 +485,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       const pctMatch = line.trim().match(/^(\d+)%/);
       if (pctMatch) {
         const pct = parseInt(pctMatch[1], 10);
-        setLiveFile(prev => ({ name: prev?.name || "", ext: prev?.ext || "", size: prev?.size || "", dir: prev?.dir || currentDirRef.current, percent: pct }));
+        setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
       } else {
         const parsed = parseFileLine(line);
         if (parsed?.name) setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
@@ -480,6 +497,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       setExitCode(code);
       setRunning(false);
       setLiveFile(null);
+      setCurrentDirInfo(null);
+      setCancelling(false);
       unlistenRef.current.forEach(fn => fn());
       unlistenRef.current = [];
       await sendDoneNotification(code);
@@ -671,14 +690,59 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       {/* ── Botón de inicio + guardar trabajo ───────────────────────────────── */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-gray-900 border-b border-gray-800 shrink-0">
         {running ? (
-          <button
-            onClick={() => invoke("cancel_robocopy").catch(() => {})}
-            className="flex items-center gap-2 px-5 py-2 bg-red-800 hover:bg-red-700 rounded-lg text-sm font-semibold text-red-200 transition-colors"
-          >
-            <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
-            {isDryRun ? "Simulando..." : "Copiando..."}
-            <span className="ml-1 text-red-400 text-xs border border-red-700 rounded px-1.5 py-0.5">✕ Cancelar</span>
-          </button>
+          <div className="flex items-center gap-2">
+            {/* Botón cancelar */}
+            {cancelling ? (
+              <div className="flex items-center gap-2 px-5 py-2 bg-red-900/60 rounded-lg text-sm font-semibold text-red-300 cursor-default select-none">
+                <svg className="w-3.5 h-3.5 animate-spin shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
+                </svg>
+                Deteniendo...
+              </div>
+            ) : (
+              <button
+                onClick={() => { setCancelling(true); invoke("cancel_robocopy").catch(() => setCancelling(false)); }}
+                className="flex items-center gap-2 px-5 py-2 bg-red-800 hover:bg-red-700 active:bg-red-900 rounded-lg text-sm font-semibold text-red-200 transition-colors"
+              >
+                <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
+                {isDryRun ? "Simulando..." : "Copiando..."}
+                <span className="ml-1 text-red-400 text-xs border border-red-700 rounded px-1.5 py-0.5">✕ Cancelar</span>
+              </button>
+            )}
+
+            {/* Botón desbloquear — solo cuando no está cancelando */}
+            {!cancelling && !isDryRun && (
+              <button
+                onClick={() => {
+                  invoke("nudge_robocopy").catch(() => {});
+                  setNudgeFeedback(true);
+                  setTimeout(() => setNudgeFeedback(false), 2000);
+                }}
+                title="Envía una señal al proceso para desbloquearlo si se quedó atascado (equivalente a Ctrl+C en CMD)"
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-all duration-200
+                  ${nudgeFeedback
+                    ? "bg-amber-900/50 border-amber-700 text-amber-300"
+                    : "bg-gray-800 hover:bg-amber-900/40 border-gray-700 hover:border-amber-700 text-gray-400 hover:text-amber-300"}`}
+              >
+                {nudgeFeedback ? (
+                  <>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-3.5 h-3.5 shrink-0">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    Señal enviada
+                  </>
+                ) : (
+                  <>
+                    {/* Icono "onda/señal" */}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5 shrink-0">
+                      <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                    </svg>
+                    Desbloquear
+                  </>
+                )}
+              </button>
+            )}
+          </div>
         ) : (
           <button onClick={startRobocopy} disabled={!canRun}
             className={`flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-colors
@@ -793,6 +857,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           source={source}
           dest={dest}
           isDryRun={isDryRun}
+          currentDirInfo={running ? currentDirInfo : null}
         />
       )}
 
@@ -864,7 +929,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
 // ─── Vista de copia en vivo ──────────────────────────────────────────────────
 
-function LiveCopyView({ liveFile, recentFiles, source, dest, isDryRun }) {
+function LiveCopyView({ liveFile, recentFiles, source, dest, isDryRun, currentDirInfo }) {
   if (!liveFile && recentFiles.length === 0) return null;
 
   const ft  = liveFile ? getFileType(liveFile.ext) : null;
@@ -891,6 +956,47 @@ function LiveCopyView({ liveFile, recentFiles, source, dest, isDryRun }) {
           {dest?.split(/[/\\]/).slice(-2).join("\\") || dest}
         </span>
       </div>
+
+      {/* ── Carpeta activa ── */}
+      {currentDirInfo && (
+        <div className="px-3 py-2.5 bg-blue-950/30 border border-blue-900/40 rounded-lg text-xs space-y-2">
+          {/* Fila: icono + ruta + contador */}
+          <div className="flex items-center gap-2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              className="w-3.5 h-3.5 text-blue-500 shrink-0">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span className="font-mono text-blue-300 truncate flex-1 min-w-0" title={currentDirInfo.path}>
+              {currentDirInfo.path}
+            </span>
+            {currentDirInfo.count > 0 ? (
+              <span className="shrink-0 font-mono tabular-nums text-blue-400">
+                <span className="text-blue-300 font-semibold">{currentDirInfo.processed}</span>
+                <span className="text-blue-700"> / </span>
+                <span>{currentDirInfo.count}</span>
+                <span className="text-blue-700 ml-1">arch.</span>
+              </span>
+            ) : currentDirInfo.processed > 0 ? (
+              <span className="shrink-0 font-mono tabular-nums text-blue-500">
+                {currentDirInfo.processed} arch.
+              </span>
+            ) : null}
+          </div>
+          {/* Mini barra de progreso por directorio */}
+          {currentDirInfo.count > 0 ? (
+            <div className="h-0.5 bg-blue-900/60 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                style={{ width: `${Math.min((currentDirInfo.processed / currentDirInfo.count) * 100, 100)}%` }}
+              />
+            </div>
+          ) : currentDirInfo.processed > 0 ? (
+            <div className="h-0.5 bg-blue-900/60 rounded-full overflow-hidden">
+              <div className="h-full w-1/3 bg-blue-600/60 rounded-full motion-safe:animate-shimmer" />
+            </div>
+          ) : null}
+        </div>
+      )}
 
       {/* ── Card de archivo activo ── */}
       {liveFile && (
