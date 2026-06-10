@@ -22,7 +22,7 @@ function classifyLine(line) {
   const t = line.trim();
   if (!t) return "empty";
   if (t.startsWith("---")) return "separator";
-  if (/^\s*\d+%/.test(line)) return "progress";
+  if (/^\s*\d+(?:\.\d+)?%/.test(line)) return "progress";
   if (/New File/i.test(line)) return "new";
   if (/\bNewer\b/i.test(line)) return "newer";
   if (/\bOlder\b/i.test(line)) return "older";
@@ -382,7 +382,9 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
           const parsed = parseFileLine(line);
           if (parsed?.name) {
-            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+            const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
+            const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
+            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
             setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
           }
         }
@@ -396,13 +398,20 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
           return [...prev, line];
         });
-        const pctMatch = line.trim().match(/^(\d+)%/);
+        const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
         if (pctMatch) {
-          const pct = parseInt(pctMatch[1], 10);
+          const pct = parseFloat(pctMatch[1]);
           setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
         } else {
           const parsed = parseFileLine(line);
-          if (parsed?.name) setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+          if (parsed?.name) {
+            if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
+              setFileCount(p => p + 1);
+              setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
+              setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
+            }
+            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+          }
         }
       });
 
@@ -468,7 +477,9 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
         const parsed = parseFileLine(line);
         if (parsed?.name) {
-          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+          const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
+          const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
+          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
           setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
         }
       }
@@ -482,13 +493,20 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
         return [...prev, line];
       });
-      const pctMatch = line.trim().match(/^(\d+)%/);
+      const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
       if (pctMatch) {
-        const pct = parseInt(pctMatch[1], 10);
+        const pct = parseFloat(pctMatch[1]);
         setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
       } else {
         const parsed = parseFileLine(line);
-        if (parsed?.name) setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+        if (parsed?.name) {
+          if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
+            setFileCount(p => p + 1);
+            setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
+            setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
+          }
+          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
+        }
       }
     });
 

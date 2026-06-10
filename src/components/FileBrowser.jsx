@@ -92,7 +92,10 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(null);
   const [checkedItems, setCheckedItems] = useState(new Set());
+  const [editingPath, setEditingPath] = useState(false);
+  const [pathInput, setPathInput] = useState("");
   const listRef = useRef(null);
+  const pathInputRef = useRef(null);
 
   useEffect(() => {
     loadDrives();
@@ -163,6 +166,23 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
     setSelected(entry.path === selected ? null : entry.path);
   }
 
+  function startEditPath() {
+    setPathInput(currentPath);
+    setEditingPath(true);
+    setTimeout(() => { pathInputRef.current?.select(); }, 0);
+  }
+
+  function commitPath() {
+    const trimmed = pathInput.trim();
+    setEditingPath(false);
+    if (trimmed && trimmed !== currentPath) navigateTo(trimmed);
+  }
+
+  function handlePathKeyDown(e) {
+    if (e.key === "Enter") commitPath();
+    if (e.key === "Escape") setEditingPath(false);
+  }
+
   const breadcrumbs = parseBreadcrumbs(currentPath);
 
   // Carpeta actualmente visible (para los botones de selección)
@@ -206,30 +226,57 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
         <button
           onClick={goUp}
           disabled={!currentPath}
-          className="p-1 rounded hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors mr-1"
+          className="p-1 rounded hover:bg-gray-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors mr-1 shrink-0"
           title="Subir un nivel"
         >
           <IconArrowUp className="w-4 h-4" />
         </button>
 
-        {breadcrumbs.length === 0 ? (
-          <span className="text-xs text-gray-600 italic">Selecciona un disco para explorar</span>
+        {editingPath ? (
+          /* ── Modo edición: input de ruta ── */
+          <input
+            ref={pathInputRef}
+            value={pathInput}
+            onChange={e => setPathInput(e.target.value)}
+            onKeyDown={handlePathKeyDown}
+            onBlur={commitPath}
+            className="selectable flex-1 bg-gray-800 border border-blue-500 rounded px-2 py-0.5 text-sm font-mono text-gray-100 focus:outline-none"
+            placeholder="C:\ruta\a\carpeta"
+            spellCheck={false}
+          />
         ) : (
-          breadcrumbs.map((crumb, i) => (
-            <span key={crumb.path} className="flex items-center gap-1">
-              {i > 0 && <IconChevron className="w-3 h-3 text-gray-600" />}
-              <button
-                onClick={() => navigateTo(crumb.path)}
-                className={`text-sm px-1 rounded hover:text-white transition-colors
-                  ${i === breadcrumbs.length - 1
-                    ? "text-gray-200 font-medium"
-                    : "text-gray-500 hover:bg-gray-700"
-                  }`}
-              >
-                {crumb.label}
-              </button>
-            </span>
-          ))
+          /* ── Modo normal: breadcrumb clickeable ── */
+          <div
+            className="flex items-center gap-1 flex-1 min-w-0 cursor-text group"
+            onClick={startEditPath}
+            title="Clic para escribir una ruta"
+          >
+            {breadcrumbs.length === 0 ? (
+              <span className="text-xs text-gray-600 italic">Selecciona un disco o haz clic aquí para escribir una ruta</span>
+            ) : (
+              breadcrumbs.map((crumb, i) => (
+                <span key={crumb.path} className="flex items-center gap-1 shrink-0">
+                  {i > 0 && <IconChevron className="w-3 h-3 text-gray-600" />}
+                  <button
+                    onClick={e => { e.stopPropagation(); navigateTo(crumb.path); }}
+                    className={`text-sm px-1 rounded hover:text-white transition-colors
+                      ${i === breadcrumbs.length - 1
+                        ? "text-gray-200 font-medium"
+                        : "text-gray-500 hover:bg-gray-700"
+                      }`}
+                  >
+                    {crumb.label}
+                  </button>
+                </span>
+              ))
+            )}
+            {/* Icono lápiz — aparece al hover */}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              className="w-3 h-3 text-gray-700 group-hover:text-gray-500 transition-colors ml-1 shrink-0">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </div>
         )}
       </div>
 
