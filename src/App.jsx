@@ -1,7 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { version } from "../package.json";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import "./index.css";
 import FileBrowser from "./components/FileBrowser";
 import RobocopyPanel from "./components/RobocopyPanel";
@@ -64,50 +62,6 @@ export default function App() {
   const [jobsVersion, setJobsVersion] = useState(0);
   const [copyStatus, setCopyStatus] = useState({ running: false, liveFile: null, ft: null, fileCount: 0 });
 
-  const [updateInfo, setUpdateInfo]   = useState(null);
-  const [updatePhase, setUpdatePhase] = useState(null); // null | 'downloading' | 'installing'
-  const [updatePct, setUpdatePct]     = useState(0);
-  const [updateError, setUpdateError] = useState(null);
-
-  useEffect(() => {
-    check().then(update => {
-      if (update?.available) setUpdateInfo(update);
-    }).catch(() => {});
-  }, []);
-
-  async function installUpdate() {
-    if (!updateInfo) return;
-    setUpdatePhase("downloading");
-    setUpdatePct(0);
-    setUpdateError(null);
-
-    try {
-      let totalBytes = 0;
-      let downloadedBytes = 0;
-
-      await updateInfo.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          totalBytes = event.data.contentLength ?? 0;
-          setUpdatePhase("downloading");
-        } else if (event.event === "Progress") {
-          downloadedBytes += event.data.chunkLength ?? 0;
-          if (totalBytes > 0) {
-            setUpdatePct(Math.round((downloadedBytes / totalBytes) * 100));
-          }
-        } else if (event.event === "Finished") {
-          setUpdatePhase("installing");
-          setUpdatePct(100);
-        }
-      });
-
-      await relaunch();
-    } catch (e) {
-      setUpdatePhase(null);
-      setUpdatePct(0);
-      setUpdateError(String(e));
-    }
-  }
-
   function handleLoadJob(job) {
     setLoadedJob({ ...job, _ts: Date.now() }); // _ts fuerza el useEffect aunque sea el mismo trabajo
     setActiveTab("robocopy");
@@ -155,76 +109,6 @@ export default function App() {
           </div>
         </div>
       </header>
-
-      {/* ── Banner de actualización ──────────────────────────────────────────── */}
-      {updateInfo && (
-        <div className="flex items-center gap-3 px-5 py-2.5 bg-blue-950 border-b border-blue-900 shrink-0 text-sm">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-            className="w-4 h-4 text-blue-400 shrink-0">
-            <polyline points="16 3 21 3 21 8" />
-            <line x1="4" y1="20" x2="21" y2="3" />
-            <polyline points="21 16 21 21 16 21" />
-            <line x1="15" y1="15" x2="21" y2="21" />
-          </svg>
-
-          {!updatePhase ? (
-            /* Estado inicial: disponible */
-            <>
-              <span className="text-blue-200 text-xs">
-                Nueva versión <strong className="text-white">v{updateInfo.version}</strong> disponible
-              </span>
-              <button
-                onClick={installUpdate}
-                className="ml-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded text-white text-xs font-semibold transition-colors"
-              >
-                Actualizar ahora
-              </button>
-              <button
-                onClick={() => setUpdateInfo(null)}
-                className="ml-auto text-blue-700 hover:text-blue-400 text-xs transition-colors"
-              >
-                Más tarde
-              </button>
-            </>
-          ) : updatePhase === "downloading" ? (
-            /* Descargando */
-            <>
-              <span className="text-blue-300 text-xs font-medium shrink-0">Descargando...</span>
-              <div className="flex items-center gap-2 flex-1">
-                <div className="relative flex-1 max-w-[200px] h-1.5 bg-blue-900 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-blue-400 rounded-full transition-all duration-300"
-                    style={{ width: `${updatePct}%` }}
-                  />
-                  {updatePct === 0 && (
-                    <div className="absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-blue-400/50 to-transparent motion-safe:animate-shimmer" />
-                  )}
-                </div>
-                <span className="text-blue-400 font-mono text-xs tabular-nums w-8">
-                  {updatePct > 0 ? `${updatePct}%` : "…"}
-                </span>
-              </div>
-            </>
-          ) : (
-            /* Instalando */
-            <>
-              <span className="text-emerald-300 text-xs font-medium shrink-0 animate-pulse">
-                Instalando v{updateInfo.version}... La app se reiniciará automáticamente.
-              </span>
-              <svg className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
-              </svg>
-            </>
-          )}
-
-          {/* Error */}
-          {updateError && (
-            <span className="text-red-400 text-xs truncate ml-2" title={updateError}>
-              Error: {updateError.slice(0, 80)}
-            </span>
-          )}
-        </div>
-      )}
 
       {/* ── Pestañas ─────────────────────────────────────────────────────────── */}
       <nav className="flex gap-1 px-4 pt-2 bg-gray-900 border-b border-gray-800 shrink-0">

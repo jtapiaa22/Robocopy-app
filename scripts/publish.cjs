@@ -135,7 +135,7 @@ for (const file of toUpload) ghUpload(file);
 
 const sig     = fs.readFileSync(nsisSig, "utf-8").trim();
 const zipBase = path.basename(nsisZip);
-const url     = `https://github.com/${REPO}/releases/download/${tag}/${zipBase.replace(/ /g, "%20")}`;
+const url     = `https://github.com/${REPO}/releases/download/${tag}/${zipBase.replace(/ /g, ".")}`;
 
 const latestJson = {
   version,

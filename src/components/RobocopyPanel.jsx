@@ -769,7 +769,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             {isDryRun
             ? "🔍 Simular (sin copiar)"
             : sourceFolders.length > 0
-              ? `▶ Copiar ${sourceFolders.length} carpetas`
+              ? `Copiar ${sourceFolders.length} carpeta(s)`
               : "Iniciar"}
           </button>
         )}

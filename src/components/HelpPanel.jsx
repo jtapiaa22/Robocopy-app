@@ -1,3 +1,5 @@
+import Actualizador from './Actualizador'
+
 const SECTIONS = [
   {
     title: "Modo de copia",
@@ -234,9 +236,15 @@ export default function HelpPanel() {
         ))}
 
         {/* Nota al pie */}
-        <div className="mt-4 mb-8 p-4 bg-gray-900 rounded-xl border border-gray-800 text-xs text-gray-500">
+        <div className="mt-4 p-4 bg-gray-900 rounded-xl border border-gray-800 text-xs text-gray-500">
           <p className="font-semibold text-gray-400 mb-1">¿Quieres ver todas las opciones de Robocopy?</p>
           <p>Abre el CMD de Windows y escribe <code className="text-cyan-400 font-mono">robocopy /?</code> para ver la documentación completa oficial.</p>
+        </div>
+
+        {/* Actualizaciones */}
+        <div className="mt-4 mb-8 p-4 bg-gray-900 rounded-xl border border-gray-800">
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Actualizaciones</p>
+          <Actualizador />
         </div>
 
       </div>
