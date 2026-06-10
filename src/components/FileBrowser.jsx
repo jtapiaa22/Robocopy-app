@@ -193,7 +193,7 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
 
       {/* ── Barra de discos ──────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-4 py-2 bg-gray-900 border-b border-gray-800 flex-wrap">
-        <span className="text-xs text-gray-500 uppercase tracking-wider mr-1">Discos</span>
+        <span className="text-xs text-gray-500 uppercase tracking-wider mr-1">Discos / Pendrives</span>
         {drives.map((drive) => (
           <button
             key={drive.letter}
