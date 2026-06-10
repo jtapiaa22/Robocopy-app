@@ -715,7 +715,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                 <svg className="w-3.5 h-3.5 animate-spin shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
                   <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
                 </svg>
-                Deteniendo...
+                estoy deteniendo, bancame...
               </div>
             ) : (
               <button
@@ -747,7 +747,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-3.5 h-3.5 shrink-0">
                       <polyline points="20 6 9 17 4 12" />
                     </svg>
-                    Señal enviada
+                    Listo, ya envie el coso
                   </>
                 ) : (
                   <>
