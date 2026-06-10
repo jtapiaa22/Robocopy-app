@@ -58,16 +58,17 @@ if (!fs.existsSync(keyFile) && !process.env.TAURI_SIGNING_PRIVATE_KEY) {
   process.exit(1);
 }
 
-// En Windows, los saltos de línea en env vars se cortan → base64 evita el problema
-const keyRaw    = process.env.TAURI_SIGNING_PRIVATE_KEY || fs.readFileSync(keyFile, "utf-8");
-const keyBase64 = Buffer.from(keyRaw).toString("base64");
+// Tauri 2 acepta la ruta del archivo directamente → evita problemas de encoding en Windows
+const signingKey = fs.existsSync(keyFile)
+  ? keyFile
+  : process.env.TAURI_SIGNING_PRIVATE_KEY;
 console.log("🔑  Clave de firma cargada.");
 
 // ── Build ─────────────────────────────────────────────────────────────────────
 
 console.log("\n🔨  Compilando (puede tardar varios minutos)...\n");
 run("npm run tauri build", {
-  TAURI_SIGNING_PRIVATE_KEY: keyBase64,
+  TAURI_SIGNING_PRIVATE_KEY: signingKey,
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
 });
 
