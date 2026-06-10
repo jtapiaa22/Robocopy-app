@@ -103,6 +103,7 @@ if (!nsisZip || !nsisSig) {
   console.log(`   Comprimiendo ${path.basename(nsisExe)}...`);
   const exeName = path.basename(nsisExe);
   const psContent = [
+    "Add-Type -AssemblyName System.IO.Compression",
     "Add-Type -AssemblyName System.IO.Compression.FileSystem",
     `$z = [System.IO.Compression.ZipFile]::Open("${nsisZip}", [System.IO.Compression.ZipArchiveMode]::Create)`,
     `[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, "${nsisExe}", "${exeName}", [System.IO.Compression.CompressionLevel]::Optimal)`,
