@@ -41,7 +41,7 @@ const TABS = [
   },
   {
     id: "help",
-    label: "Guía",
+    label: "Guía y Actualizaciones",
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
         <circle cx="12" cy="12" r="10" />
