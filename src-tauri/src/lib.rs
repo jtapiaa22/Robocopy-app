@@ -46,6 +46,7 @@ struct ProcessState {
 
 struct CloneState {
     cancel: Arc<AtomicBool>,
+    active: AtomicBool,
 }
 
 // ─── Estructuras de datos ────────────────────────────────────────────────────
@@ -378,18 +379,19 @@ fn nudge_robocopy(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn cancel_robocopy(app: tauri::AppHandle) -> Result<(), String> {
+async fn cancel_robocopy(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<ProcessState>();
     state.cancelled.store(true, Ordering::SeqCst);
-    if let Some(pid) = *state.pid.lock().unwrap() {
-        let mut cmd = std::process::Command::new("taskkill");
+    // Extraer pid antes del await para no retener el MutexGuard (no es Send)
+    let pid = *state.pid.lock().unwrap();
+    if let Some(pid) = pid {
+        let mut cmd = Command::new("taskkill");
         cmd.args(["/PID", &pid.to_string(), "/F", "/T"]);
         #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
+        cmd.creation_flags(0x08000000);
+        if let Ok(mut child) = cmd.spawn() {
+            let _ = child.wait().await;
         }
-        cmd.spawn().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -489,13 +491,16 @@ async fn start_clone(
     state: tauri::State<'_, CloneState>,
 ) -> Result<(), String> {
     state.cancel.store(false, Ordering::Relaxed);
+    state.active.store(true, Ordering::SeqCst);
     let cancel = state.cancel.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         clone_disk_blocking(source_index, dest_index, dest_letters, expand_partition, app, cancel)
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await;
+
+    state.active.store(false, Ordering::SeqCst);
+    result.map_err(|e| e.to_string())?
 }
 
 // Declaraciones explícitas de las API de Windows para I/O de disco
@@ -876,7 +881,21 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessState { pid: Mutex::new(None), cancelled: AtomicBool::new(false) })
-        .manage(CloneState { cancel: Arc::new(AtomicBool::new(false)) })
+        .manage(CloneState { cancel: Arc::new(AtomicBool::new(false)), active: AtomicBool::new(false) })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let ps = window.state::<ProcessState>();
+                let cs = window.state::<CloneState>();
+                let has_process = ps.pid.lock().map(|g| g.is_some()).unwrap_or(false);
+                let process_cancelled = ps.cancelled.load(Ordering::SeqCst);
+                let is_cloning = cs.active.load(Ordering::SeqCst);
+                let clone_cancelled = cs.cancel.load(Ordering::SeqCst);
+                if (has_process && !process_cancelled) || (is_cloning && !clone_cancelled) {
+                    api.prevent_close();
+                    let _ = window.emit("app-close-requested", ());
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {

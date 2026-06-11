@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { version } from "../package.json";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import FileBrowser from "./components/FileBrowser";
@@ -79,39 +80,32 @@ export default function App() {
   const [copyStatus, setCopyStatus] = useState({ running: false, liveFile: null, ft: null, fileCount: 0 });
   const [cloning, setCloning]       = useState(false);
   const [showCloseWarning, setShowCloseWarning] = useState(false);
-  const [pendingClose, setPendingClose] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
-  // Ref para que el handler de cierre siempre lea el valor más fresco sin re-registrarse
-  const operationActiveRef = useRef(false);
-  useEffect(() => {
-    operationActiveRef.current = copyStatus.running || cloning;
-  }, [copyStatus.running, cloning]);
-
-  // Cierra la ventana cuando el proceso termina después de que el usuario confirmó cancelar
-  useEffect(() => {
-    if (pendingClose && !copyStatus.running && !cloning) {
-      getCurrentWindow().close();
-    }
-  }, [pendingClose, copyStatus.running, cloning]);
-
-  // Registrar handler de cierre una sola vez
+  // El backend Rust emite este evento cuando detecta cierre con proceso activo
   useEffect(() => {
     let unlisten;
-    getCurrentWindow().onCloseRequested((event) => {
-      if (operationActiveRef.current) {
-        event.preventDefault();
-        setShowCloseWarning(true);
-      }
+    listen("app-close-requested", () => {
+      setShowCloseWarning(true);
     }).then(fn => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  // Si el proceso terminó solo mientras el aviso estaba visible, cerrar automáticamente
+  useEffect(() => {
+    if (showCloseWarning && !copyStatus.running && !cloning) {
+      setShowCloseWarning(false);
+      getCurrentWindow().close();
+    }
+  }, [showCloseWarning, copyStatus.running, cloning]);
+
   async function handleCancelAndClose() {
-    setPendingClose(true);
+    setCancelling(true);
     try {
       if (copyStatus.running) await invoke("cancel_robocopy");
       if (cloning) await invoke("cancel_clone");
     } catch (_) {}
+    getCurrentWindow().close();
   }
 
   function handleLoadJob(job) {
@@ -137,7 +131,7 @@ export default function App() {
               <p className="text-sm font-semibold text-gray-100">Operación en curso</p>
             </div>
 
-            {pendingClose ? (
+            {cancelling ? (
               <div className="flex items-center gap-3 py-2 text-sm text-gray-400">
                 <svg className="w-4 h-4 animate-spin shrink-0 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
                   <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
