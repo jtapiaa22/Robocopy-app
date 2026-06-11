@@ -4,6 +4,29 @@
 
 ---
 
+## 0. Resumen ejecutivo
+
+El clone actual copia sector a sector, por lo que el destino debe ser >= origen.
+Este plan permite clonar a un disco más chico copiando **solo los clusters con
+datos**, usando el bitmap de asignación que Windows expone por ioctl.
+
+Hay dos estrategias posibles. Ambas quedan documentadas; hay que elegir una
+antes de implementar:
+
+| | Estrategia A: copia sparse + parche de boot sector | Estrategia B: encoger origen → clonar → restaurar |
+|---|---|---|
+| Toca el disco origen | No (solo lectura) | Sí (shrink temporal, reversible) |
+| Consistencia del filesystem destino | **Riesgosa** — metadata interna queda inconsistente (ver §8.1) | Garantizada — Windows mantiene el FS consistente |
+| Código nuevo | Mucho (bitmap, runs, parches, tablas) | Poco (PowerShell + el clone actual) |
+| Límite de encogimiento | Posición del último cluster usado | Posición del último cluster *inamovible* (suele ser peor) |
+| Velocidad | Copia solo datos usados | Copia hasta el tamaño encogido (incluye huecos internos) |
+
+**Recomendación**: prototipar B primero (días de trabajo, bajo riesgo) y medir
+si su límite de shrink alcanza para los casos reales. Implementar A solo si B
+se queda corta. El resto del documento desarrolla A en detalle, con B en §9.
+
+---
+
 ## 1. Por qué el clone actual no puede ir a disco más chico
 
 El clone actual hace esto:
@@ -15,7 +38,7 @@ leer sector N → escribir sector N   ← si N > sectores del destino, no hay d�
 ```
 
 Es ciego. No sabe qué sectores tienen datos reales y cuáles son espacio libre.
-Si el origen tiene 500 GB y el destino 250 GB, en el sector 500.000.000 se queda sin espacio.
+Si el origen tiene 500 GB y el destino 250 GB, se queda sin espacio a mitad de camino.
 
 ---
 
@@ -23,7 +46,7 @@ Si el origen tiene 500 GB y el destino 250 GB, en el sector 500.000.000 se queda
 
 ### API clave: FSCTL_GET_VOLUME_BITMAP
 
-Windows expone esta ioctl en cualquier volumen montado (\\.\D:, \\.\E:, etc.).
+Windows expone esta ioctl en cualquier volumen montado (`\\.\D:`, `\\.\E:`, etc.).
 Devuelve un mapa de bits donde:
   - 1 bit = 1 cluster del filesystem
   - bit = 1 → ese cluster tiene datos
@@ -32,43 +55,73 @@ Devuelve un mapa de bits donde:
 No necesitamos entender NTFS ni FAT internamente. Windows ya sabe qué clusters usa.
 
 ```
-Código IOCTL: 0x0009006F
+Código IOCTL: 0x0009006F   (= CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 27, METHOD_NEITHER, FILE_ANY_ACCESS))
 
-Input  (8 bytes): { starting_lcn: i64 }   → siempre 0 (empezar desde el inicio)
-Output (variable):
-  { starting_lcn: i64,      (8 bytes) — primer cluster del bitmap
-    bitmap_size:  i64,      (8 bytes) — total de clusters en el volumen
-    buffer:       [u8; ?]   (1 bit por cluster, redondeado al byte) }
+Input  (8 bytes): STARTING_LCN_INPUT_BUFFER { StartingLcn: i64 }
+Output (VOLUME_BITMAP_BUFFER):
+  { StartingLcn:  i64,     (8 bytes) → primer cluster representado en el buffer
+    BitmapSize:   i64,     (8 bytes) → cantidad de clusters representados
+    Buffer:       [u8; ?]  (1 bit por cluster, redondeado al byte) }
 
-Para leer el bit del cluster N:
+Para leer el bit del cluster N (relativo a StartingLcn):
   byte = N / 8
   bit  = N % 8
-  usado = (buffer[byte] >> bit) & 1 == 1
+  usado = (Buffer[byte] >> bit) & 1 == 1
 ```
+
+**Detalles de implementación que NO son opcionales:**
+
+1. **El buffer puede no alcanzar.** Si el buffer de salida es chico, `DeviceIoControl`
+   falla con `ERROR_MORE_DATA` (234) pero devuelve un fragmento válido. Hay que
+   iterar: repetir la llamada con `StartingLcn = StartingLcn_devuelto +
+   clusters_recibidos` hasta cubrir todo el volumen. Conviene iterar con buffers
+   de ~16 MB en lugar de pedir todo de una (un volumen de 8 TB con clusters de
+   4K necesita ~256 MB de bitmap).
+2. **El `StartingLcn` devuelto puede ser menor al pedido** (el FS lo redondea
+   hacia abajo a múltiplos de 8). Usar siempre el valor devuelto, no el pedido.
+3. **Los bits sobrantes del último byte son basura.** Si `BitmapSize` no es
+   múltiplo de 8, enmascarar los bits que exceden `BitmapSize`.
+4. **El bitmap es una foto del momento.** Si el volumen sigue montado y activo,
+   puede cambiar mientras copiamos → ver §8.2 (lock del volumen).
 
 ### Vocabulario
 
 | Término | Definición |
 |---|---|
-| Sector | Unidad física mínima del disco = 512 bytes |
-| Cluster | Agrupación lógica del filesystem. En NTFS (disco > 2 GB) = 4096 bytes = 8 sectores |
-| LBA | Número de sector desde el inicio del disco físico (empieza en 0) |
-| Partition offset | LBA donde empieza la partición dentro del disco físico |
+| Sector | Unidad lógica mínima del disco. Casi siempre 512 bytes, pero existen discos 4Kn → verificar con IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, no asumir |
+| Cluster | Agrupación lógica del filesystem. En NTFS (volumen > 2 GB) típicamente 4096 bytes = 8 sectores. Obtener el real con GetDiskFreeSpaceW |
+| LCN | Logical Cluster Number: número de cluster desde el inicio del VOLUMEN |
+| LBA | Número de sector desde el inicio del DISCO físico (empieza en 0) |
+| Partition offset | Byte donde empieza la partición dentro del disco físico (Get-Partition lo da directo en bytes) |
 | Cluster bitmap | Array de bits. Bit N = cluster N del volumen. 1=ocupado, 0=libre |
 | Run | Serie de clusters consecutivos con el mismo estado (todos usados o todos libres) |
 
-### Conversión cluster → offset físico en disco
+### Dónde leer y dónde escribir (simplificación importante)
+
+**Lectura del origen: por el handle del VOLUMEN, no del disco físico.**
+Al abrir `\\.\D:` los offsets de lectura son relativos al inicio del volumen:
 
 ```
-offset_fisico_en_disco = (partition_offset_lba × 512) + (cluster_n × cluster_size_bytes)
+offset_lectura = LCN × cluster_size          ← sin aritmética de partición
 ```
 
-Ejemplo: partición empieza en LBA 2048, cluster size = 4096 bytes, cluster 1000:
+**Escritura al destino: por el handle del DISCO físico** (el destino no tiene
+volúmenes montados después de Clear-Disk):
+
 ```
-offset = (2048 × 512) + (1000 × 4096)
-       = 1.048.576 + 4.096.000
-       = 5.144.576 bytes desde el inicio del disco
+offset_escritura = partition_offset_destino + LCN × cluster_size
 ```
+
+Esto elimina la mitad de la aritmética de offsets y la mitad de los errores
+posibles. Para posicionarse se usa `SetFilePointerEx` antes de cada
+ReadFile/WriteFile.
+
+Con `FILE_FLAG_NO_BUFFERING`, offsets y tamaños deben ser múltiplos del sector:
+los runs siempre lo cumplen (los clusters son múltiplos de 512), y la alineación
+del buffer en memoria ya está resuelta en el código actual (`align_offset(512)`).
+
+**Los runs se trocean en chunks** (ej. 4 MB) aunque sean contiguos: un run de
+80 GB en una sola operación de I/O impediría reportar progreso y cancelar.
 
 ---
 
@@ -77,224 +130,276 @@ offset = (2048 × 512) + (1000 × 4096)
 Después de copiar, el filesystem del destino tiene en su boot sector el tamaño
 del ORIGEN (porque copiamos esos bytes también). Hay que actualizarlo.
 
-### NTFS Boot Sector (primeros 512 bytes de la partición)
-```
-Offset 0x28 (40 decimal) → TotalSectors → 8 bytes (QWORD)
+### NTFS — boot sector (primeros 512 bytes de la partición)
 
-Ejemplo:
-  Origen  tiene 600.000.000 sectores → TotalSectors = 600.000.000
-  Destino tiene 350.000.000 sectores → hay que escribir 350.000.000 en ese offset
+```
+Offset 0x28 (40 decimal) → TotalSectors → 8 bytes (QWORD, little-endian)
 ```
 
-### FAT32 Boot Sector
+**Dos detalles que el parche simple omite y rompen el volumen:**
+
+1. `TotalSectors` en NTFS es `sectores_de_la_partición - 1`: el último sector
+   de la partición queda FUERA del volumen, reservado para el **backup boot
+   sector**.
+2. NTFS guarda una **copia del boot sector en ese último sector**. chkdsk y el
+   montaje la verifican. Después de parchear el boot sector hay que escribir la
+   misma copia parcheada en `partition_offset + partition_size - 512`.
+
+### FAT32 — boot sector
+
 ```
 Offset 0x20 (32 decimal) → TotalSectors32 → 4 bytes (DWORD)
 ```
 
-### exFAT Boot Sector
+FAT32 además tiene backup del boot sector (típicamente el sector 6 de la
+partición; el offset real está en el campo BkBootSec, offset 0x32 del BPB) →
+parchear ambos. El FSInfo (cuenta de clusters libres) quedará desactualizado;
+es solo un hint, chkdsk lo corrige.
+
+### exFAT — boot sector
+
 ```
-Offset 0x48 (72 decimal) → VolumeLength → 8 bytes (QWORD, en clusters, no sectores)
+Offset 0x48 (72 decimal) → VolumeLength → 8 bytes (QWORD) → EN SECTORES
 ```
 
-La operación es: leer los primeros 512 bytes de la partición en el destino,
-sobrescribir esos bytes en la posición correcta, escribir de vuelta. Sin parser,
-sin librería de filesystem.
+⚠ **Corrección sobre la versión anterior de este plan: VolumeLength está en
+SECTORES, no en clusters.**
+
+exFAT es el más delicado de parchear:
+- El sector 11 de la partición contiene un **checksum de los sectores 0–10**.
+  Cambiar un byte del boot sector sin recalcular ese checksum → volumen inválido.
+- Hay una **boot region de backup completa en los sectores 12–23** (con su
+  propio checksum en el sector 23) → repetir el parche y el checksum ahí.
+
+### ⚠ Limitación de fondo de TODOS estos parches → ver §8.1
+
+El boot sector es solo la "portada" del filesystem. La metadata interna
+($Bitmap de NTFS, las tablas FAT, el allocation bitmap de exFAT) sigue
+dimensionada para el volumen ORIGINAL más grande. El parche del boot sector no
+arregla eso. Es el riesgo #1 de la Estrategia A.
 
 ---
 
 ## 4. Qué pasa con la tabla de particiones
 
-### MBR (disco con tabla de particiones vieja)
-El MBR vive en el sector 0 del disco. Tiene 4 entradas de partición, cada una de 16 bytes:
+### Opción recomendada: que Windows escriba la tabla
+
+En lugar de escribir MBR/GPT a mano, después de `Clear-Disk` crear las
+particiones con PowerShell:
+
+```powershell
+Initialize-Disk -Number N -PartitionStyle MBR   # o GPT, igual que el origen
+New-Partition -DiskNumber N -Offset <bytes> -Size <bytes> -MbrType ...  # o -GptType "{guid}"
 ```
-Offset 446: entrada 1
+
+Windows escribe el MBR o el GPT completo (headers, backup header al final del
+disco, CRC32s, protective MBR) sin que tengamos que tocar un byte. Solo hay que
+replicar offset, tamaño y tipo de cada partición del origen
+(`Get-Partition | Select Offset, Size, MbrType/GptType, IsActive`).
+
+Después se copia el CONTENIDO de cada partición por encima (la partición creada
+queda RAW hasta que llegan el boot sector y los datos del origen).
+
+Esto elimina por completo las secciones de "escribir MBR a mano" y "recalcular
+CRC32 de GPT". Quedan abajo solo como referencia por si la opción PowerShell
+resulta inviable en la práctica.
+
+### Referencia: MBR a mano (solo si New-Partition no sirve)
+
+El MBR vive en el sector 0 del disco. 4 entradas de 16 bytes desde el offset 446:
+```
   +0  : estado (0x80 = booteable)
-  +1  : CHS inicio (obsoleto, ignorar)
-  +4  : tipo de partición (0x07 = NTFS, 0x0B = FAT32, etc.)
-  +5  : CHS fin (obsoleto, ignorar)
-  +8  : LBA inicio → 4 bytes ← este es el que nos importa
-  +12 : LBA tamaño → 4 bytes ← ESTE hay que actualizar con el nuevo tamaño
-Offset 462: entrada 2
-...
+  +1  : CHS inicio (3 bytes, obsoleto, ignorar)
+  +4  : tipo de partición (0x07 = NTFS/exFAT, 0x0C = FAT32 LBA, etc.)
+  +5  : CHS fin (3 bytes, obsoleto, ignorar)
+  +8  : LBA inicio  → 4 bytes
+  +12 : LBA tamaño  → 4 bytes → actualizar con el nuevo tamaño
 ```
 
-Para el destino: copiar el MBR del origen, pero actualizar el campo "LBA tamaño"
-de cada partición para que refleje el nuevo tamaño.
+### Referencia: GPT a mano (solo si New-Partition no sirve)
 
-### GPT (disco moderno)
-Más complejo: tiene header en sector 1 + backup header en el ÚLTIMO sector del disco.
-El backup hay que recalcularlo para la posición correcta en el disco destino.
-También tiene checksums CRC32 que hay que recalcular.
+Hay que actualizar y mantener coherentes:
+- Header primario (LBA 1): `AlternateLBA` (→ último LBA del disco destino),
+  `LastUsableLBA`, CRC32 de la tabla de particiones, CRC32 del propio header
+  (calculado con el campo CRC en cero).
+- Tabla de particiones (LBA 2–33): `FirstLBA`/`LastLBA` de cada entrada.
+- Header de backup (ÚLTIMO LBA del disco destino): espejo del primario con
+  `MyLBA`/`AlternateLBA` intercambiados y `PartitionEntryLBA` apuntando a la
+  copia de la tabla al final; recalcular ambos CRC32.
+- Protective MBR (sector 0): campo de tamaño de la partición tipo 0xEE.
 
-**Decisión de implementación**: Para la primera versión, manejar MBR y GPT.
-GPT requiere: mover backup header, recalcular CRC32 del header y de la tabla de particiones.
+Es exactamente el tipo de código propenso a errores que la opción PowerShell evita.
 
 ---
 
-## 5. Algoritmo completo paso a paso
+## 5. Algoritmo completo paso a paso (Estrategia A)
 
 ```
-ENTRADA: source_index (número de disco origen)
-         dest_index   (número de disco destino)
-         expand_partition (bool)
+ENTRADA: source_index, dest_index, expand_partition (bool)
 
-─── FASE 1: ANÁLISIS ──────────────────────────────────────────────────────────
+━━ FASE 0: VALIDACIONES PREVIAS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. Leer esquema del disco origen (PowerShell Get-Partition):
+0a. BitLocker en alguna partición del origen → no ofrecer modo sparse
+    (el bitmap no refleja el contenido cifrado real; solo clone sector a
+    sector con destino >= origen). Detección: Get-BitLockerVolume.
+0b. Dirty bit del volumen origen (fsutil dirty query X:) → si está sucio,
+    pedir chkdsk antes de clonar.
+0c. Tamaño de sector lógico de ambos discos (IOCTL_DISK_GET_DRIVE_GEOMETRY_EX).
+    Si difieren (512e vs 4Kn) → ABORTAR con mensaje claro (offsets y boot
+    sectors no son trasladables entre tamaños de sector distintos).
+
+━━ FASE 1: ANÁLISIS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Leer esquema del disco origen (Get-Partition):
    - Tipo tabla: MBR o GPT
-   - Por cada partición: { offset_bytes, size_bytes, drive_letter, filesystem }
+   - Por cada partición: { offset_bytes, size_bytes, drive_letter, tipo, filesystem }
 
 2. Por cada partición:
-   a. Si NO tiene letra (EFI, Recovery, Reserved, sin formato):
-      → modo = "sector_a_sector"
-      → min_size = tamaño original de la partición
+   a. Sin letra o filesystem desconocido (EFI, MSR, Recovery, RAW):
+      → modo = "sector_a_sector", min_size = tamaño original
 
-   b. Si tiene letra y filesystem conocido (NTFS / FAT32 / exFAT):
-      → Abrir \\.\X: con GENERIC_READ + FILE_SHARE_READ + FILE_SHARE_WRITE
-      → Llamar FSCTL_GET_VOLUME_BITMAP desde cluster 0
-      → Iterar bitmap, encontrar último cluster con bit=1
-      → min_data_bytes = (ultimo_cluster_usado + 1) × cluster_size
-      → min_size = min_data_bytes + 5% overhead
+   b. Con letra y NTFS / FAT32 / exFAT:
+      → FSCTL_GET_VOLUME_BITMAP (iterando, §2)
+      → último cluster usado = mayor LCN con bit=1
+      → min_size = (último_LCN + 1) × cluster_size + cluster_size
+        (margen de 1 cluster; en NTFS cubre además el backup boot sector)
       → modo = "sparse"
 
-3. Calcular min_total = suma de min_size de todas las particiones + gaps entre ellas
-   Si min_total > tamaño disco destino → RETORNAR ERROR con mensaje claro
+3. Layout v1 (decisión de alcance, ver §8.4):
+   SOLO se encoge la ÚLTIMA partición; todas las anteriores conservan
+   offset y tamaño originales.
+   min_total = offset de la última partición + min_size de la última
+   Si min_total > tamaño disco destino → ERROR con desglose por partición
 
-─── FASE 2: PREPARAR DESTINO ──────────────────────────────────────────────────
+━━ FASE 2: PREPARAR DESTINO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-4. Emitir evento: "Limpiando disco destino..."
-5. Clear-Disk (ya implementado)
-6. Pausa 800ms
+4. Emitir "Limpiando disco destino..."
+5. Clear-Disk (ya implementado) + pausa 800 ms
 
-─── FASE 3: ESCRIBIR TABLA DE PARTICIONES EN DESTINO ─────────────────────────
+━━ FASE 3: CREAR PARTICIONES EN DESTINO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-7. Leer sector 0 (MBR) o sectores 0-33 (GPT) del origen
-8. Calcular nuevo layout: mismas particiones pero con nuevos tamaños
-   - Mantener el mismo orden
-   - Particiones "sector_a_sector": mismo tamaño exacto
-   - Particiones "sparse": min_size × 1.05 (datos + 5% holgura)
-   - La última partición de datos: usar todo el espacio restante del destino
-     (excepto si hay particiones de recuperación al final)
-9. Escribir nueva tabla de particiones en sector 0 del destino
+6. Initialize-Disk con el mismo estilo (MBR/GPT) que el origen
+7. New-Partition por cada partición: mismo offset y tipo; mismo tamaño,
+   salvo la última que toma min_size. (Extenderla después depende de que
+   chkdsk haya reparado la metadata interna — ver §8.1 y paso 16.)
+8. Quitar letras auto-asignadas en el destino (Remove-PartitionAccessPath)
+   para que nada escriba ahí durante la copia.
 
-─── FASE 4: COPIAR CADA PARTICIÓN ────────────────────────────────────────────
+━━ FASE 4: BLOQUEAR ORIGEN Y COPIAR ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+9. Por cada volumen origen con letra: FSCTL_LOCK_VOLUME (ver §8.2).
+   Si falla (archivos abiertos) → advertir "la copia puede salir
+   inconsistente" y dejar elegir entre continuar o abortar.
 
 10. Para cada partición en orden:
 
-    [MODO sector_a_sector]
-    → Loop normal: leer chunk del origen, escribir en destino
-       (posición física = partition_offset + posición dentro de la partición)
+    [sector_a_sector]
+    → leer del PhysicalDrive origen desde partition_offset_src,
+      escribir al PhysicalDrive destino desde partition_offset_dst
 
-    [MODO sparse]
-    → Para cada run de clusters USADOS consecutivos en el bitmap:
-         offset_src = partition_offset_src + (cluster_inicio × cluster_size)
-         offset_dst = partition_offset_dst + (cluster_inicio × cluster_size)
-         ReadFile(src_handle, offset_src, run_size)
-         WriteFile(dst_handle, offset_dst, run_size)
-    → Clusters libres: NO se escriben. Destino ya está en cero (Clear-Disk).
+    [sparse]
+    → handle de lectura: \\.\X:  (volumen origen)
+    → handle de escritura: PhysicalDrive destino
+    → por cada run de clusters usados consecutivos:
+         por cada chunk de hasta 4 MB dentro del run:
+           SetFilePointerEx(src_vol, LCN×cluster_size)
+           ReadFile(...)
+           SetFilePointerEx(dst_disk, part_offset_dst + LCN×cluster_size)
+           WriteFile(...)
+           progreso += chunk; chequear cancel
+    → clusters libres: NO se escriben (el destino quedó en cero con Clear-Disk)
 
-─── FASE 5: PARCHEAR BOOT SECTORS ───────────────────────────────────────────
+━━ FASE 5: PARCHEAR BOOT SECTORS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-11. Para cada partición "sparse" en el destino:
-    → Calcular nuevo_total_sectores = new_partition_size_bytes / 512
-    → Leer primeros 512 bytes de la partición desde el destino
-    → Detectar filesystem (magic bytes en el boot sector)
-    → Escribir nuevo_total_sectores en el offset correcto
-    → Escribir los 512 bytes de vuelta al destino
+11. Para cada partición "sparse" cuyo tamaño cambió:
+    → detectar FS por magic bytes ("NTFS    ", "EXFAT   ", BPB de FAT32)
+    → NTFS : TotalSectors (0x28) = nuevos_sectores_partición - 1
+             + escribir copia del boot sector parcheado en el último sector
+    → FAT32: TotalSectors32 (0x20) + backup en el sector BkBootSec
+    → exFAT: VolumeLength (0x48, EN SECTORES)
+             + recalcular checksum (sector 11) + boot region backup (12–23)
 
-─── FASE 6: POST-PROCESO ─────────────────────────────────────────────────────
+━━ FASE 6: POST-PROCESO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-12. diskpart uniqueid disk → nueva firma (evita colisión con origen)
-13. Set-Disk -IsOffline $false
-14. Update-Disk
-15. Si expand_partition: Resize-Partition en la última partición de datos
+12. Soltar locks del origen (CloseHandle)
+13. Nueva firma/GUID de disco en el destino (ya implementado: diskpart uniqueid)
+14. Set-Disk -IsOffline $false ; Update-Disk
+15. chkdsk /f sobre cada volumen sparse del destino (ver §8.1 — NO es opcional)
+16. Si expand_partition y chkdsk dejó el FS sano: Resize-Partition al máximo
 ```
 
 ---
 
-## 6. Cambios en el código (cuando lo implementemos)
+## 6. Cambios en el código (cuando se implemente)
 
-### lib.rs — nuevas funciones Rust
+### lib.rs — nuevas funciones
 
 ```rust
-// Obtiene el bitmap de clusters usados de un volumen montado
-fn get_volume_bitmap(drive_letter: &str) -> Result<VolumeBitmap, String>
-
-// Estructura que devuelve get_volume_bitmap  
 struct VolumeBitmap {
-    starting_lcn: u64,
-    bitmap_size: u64,       // total de clusters
-    buffer: Vec<u8>,        // 1 bit por cluster
-    cluster_size: u64,      // bytes por cluster
+    bitmap_size: u64,     // total de clusters del volumen
+    buffer: Vec<u8>,      // 1 bit por cluster (bits sobrantes ya enmascarados)
+    cluster_size: u64,    // bytes por cluster
 }
 
-// Encuentra el último cluster con datos
-fn last_used_cluster(bitmap: &VolumeBitmap) -> u64
+// Itera FSCTL_GET_VOLUME_BITMAP hasta cubrir el volumen (maneja ERROR_MORE_DATA)
+fn get_volume_bitmap(drive_letter: &str) -> Result<VolumeBitmap, String>
 
-// Itera el bitmap y copia solo los runs usados
+fn last_used_cluster(bitmap: &VolumeBitmap) -> Option<u64>
+
+// Itera runs usados y copia por chunks, leyendo del volumen y escribiendo al disco
 fn copy_sparse(
-    src: *mut c_void,       // handle disco origen
-    dst: *mut c_void,       // handle disco destino  
+    src_vol: *mut c_void,          // handle \\.\X: (volumen origen)
+    dst_disk: *mut c_void,         // handle PhysicalDrive destino
     bitmap: &VolumeBitmap,
-    src_partition_offset: u64,  // bytes desde inicio del disco
-    dst_partition_offset: u64,
+    dst_partition_offset: u64,     // bytes desde el inicio del disco destino
     app: &tauri::AppHandle,
     cancel: &Arc<AtomicBool>,
-) -> Result<u64, String>    // retorna bytes copiados
+) -> Result<u64, String>           // bytes copiados
 
-// Actualiza TotalSectors en el boot sector del filesystem
+// Parchea TotalSectors/VolumeLength según FS + copias de backup + checksums
 fn patch_boot_sector(
-    dst: *mut c_void,
-    partition_offset_bytes: u64,
-    new_size_bytes: u64,
+    dst_disk: *mut c_void,
+    partition_offset: u64,
+    new_partition_size: u64,
 ) -> Result<(), String>
 ```
 
 ### lib.rs — nuevo comando Tauri
 
 ```rust
-// Analiza el origen y calcula si cabe en el destino ANTES de empezar
-// El frontend lo llama al seleccionar ambos discos
+// Solo analiza, no copia. El frontend lo llama al seleccionar ambos discos.
 #[tauri::command]
-async fn analyze_clone(source_index: u32, dest_size_bytes: u64) -> Result<CloneAnalysis, String>
+async fn analyze_clone(source_index: u32, dest_index: u32) -> Result<CloneAnalysis, String>
 
 struct PartitionAnalysis {
     letter: Option<String>,
-    partition_type: String,   // "ntfs" | "fat32" | "exfat" | "system" | "unknown"
+    filesystem: String,       // "ntfs" | "fat32" | "exfat" | "raw" | ...
     original_size: u64,
-    used_size: u64,           // 0 si no tiene letra
-    min_required: u64,        // used_size + 5%
+    used_bytes: u64,          // suma de clusters con bit=1 (lo que se va a copiar)
+    min_required: u64,        // (último_LCN+1) × cluster_size + margen — NO es used_bytes
     clone_mode: String,       // "sparse" | "sector_by_sector"
+    bitlocker: bool,
 }
 
 struct CloneAnalysis {
     can_fit: bool,
+    sector_size_mismatch: bool,
     partitions: Vec<PartitionAnalysis>,
     total_min_required: u64,
-    total_used_data: u64,
+    total_used_data: u64,     // para estimar tiempo de copia
 }
 ```
 
-### CloneDisk.jsx — cambios de UI
+Nota: `used_bytes` (datos a copiar) y `min_required` (espacio que exige el
+destino) son cosas distintas — por la fragmentación, `min_required` puede ser
+mucho mayor. La UI debe mostrar ambos.
 
-1. Al seleccionar origen + destino → llamar `analyze_clone` automáticamente
-2. Mostrar desglose por partición:
-   - "Partición C: (NTFS) — usa 150 GB de 297 GB → necesita 158 GB mínimo"
-3. Si `can_fit = false`: deshabilitar botón + mensaje claro
-4. Si origen > destino pero `can_fit = true`: mostrar aviso verde "Los datos caben"
-5. Mostrar tiempo estimado basado en `total_used_data` (no en tamaño del origen)
-
-### disk_win mod — nueva constante
+### disk_win mod — agregar
 
 ```rust
 pub const FSCTL_GET_VOLUME_BITMAP: u32 = 0x0009006F;
-```
+pub const ERROR_MORE_DATA: u32 = 234;
 
-### Nueva función extern en disk_win
-
-```rust
-// Para setear el puntero del archivo antes de leer/escribir en offset específico
-// (necesario para reads/writes en posiciones arbitrarias del disco)
 pub fn SetFilePointerEx(
     hfile: *mut c_void,
     li_distance_to_move: i64,
@@ -303,329 +408,180 @@ pub fn SetFilePointerEx(
 ) -> i32;
 ```
 
----
+### CloneDisk.jsx — cambios de UI
+
+1. Al seleccionar origen + destino → llamar `analyze_clone` automáticamente
+2. Desglose por partición:
+   "Partición C: (NTFS) — 150 GB de datos, necesita 158 GB en destino (por fragmentación)"
+3. `can_fit = false` → botón deshabilitado + mensaje con opciones (disco más
+   grande / desfragmentar el origen)
+4. Origen > destino pero `can_fit = true` → aviso verde "Los datos caben"
+5. Tiempo estimado basado en `total_used_data`, no en el tamaño del origen
 
 ---
 
-# EJEMPLO 1 — 500 GB origen, 180 GB usados → destino 250 GB
-
-## Datos del ejemplo
+## 7. Ejemplo numérico
 
 ```
-DISCO ORIGEN: 500 GB físicos
-  Sectores totales:   1.000.000.000  (500 GB / 512 bytes)
-  Tabla de particiones: MBR
-
-  Partición única:
-    Inicio: LBA 2048  (= sector 2048 = byte 1.048.576 del disco)
-    Fin:    LBA 976.771.071
-    Tamaño: 976.769.023 sectores = ~488 GB
-    Filesystem: NTFS
-    Letra: D:
-    Cluster size: 4096 bytes (= 8 sectores)
-    Total clusters: 976.769.023 / 8 = 122.096.127
-    Usados: 46.080.000  (180 GB / 4096 bytes por cluster)
-    Libres: 76.016.127  (308 GB de espacio libre)
-    Último cluster con datos: #45.800.000
-
-DISCO DESTINO: 250 GB físicos
-  Sectores totales: 500.000.000
-```
-
-## Fase 1: Análisis
-
-```
-Abrir \\.\D: → FSCTL_GET_VOLUME_BITMAP
-
-Bitmap recibido:
-  bitmap_size   = 122.096.127 clusters
-  buffer        = 122.096.127 bits = 15.262.015 bytes ≈ 15 MB de datos
-
-Iterar bitmap buscando el último bit=1:
-  → último cluster usado = #45.800.000
-
-Cálculo:
-  min_data  = 45.800.000 × 4096 = 187.596.800.000 bytes = 174.7 GB
-  overhead  = 5% = +8.7 GB
-  min_total = 183.4 GB
-
-¿Entra en 250 GB? 183.4 GB < 250 GB → ✓ SÍ, se puede clonar
-
-Ahorro respecto al clone viejo:
-  Clone viejo copiaba: 488 GB
-  Clone nuevo copia:   180 GB
-  Ahorro: 308 GB (63% menos I/O)
-```
-
-## Fase 3: Nuevo layout para el destino
-
-```
-DISCO DESTINO — plan de layout:
-  Sector 0: MBR (con entrada de partición actualizada)
-
-  Partición 1:
-    Inicio: LBA 2048 (igual que origen, mismo alineamiento)
-    Tamaño: 490.000.000 sectores ≈ 234 GB
-           (usamos casi todo el disco, dejando ~16 GB sin asignar para margen)
-    Fin:    LBA 490.002.047
-
-  Sin asignar: sectores 490.002.048 al 499.999.999 (≈ 16 GB)
-
-MBR — entrada de partición que hay que escribir:
-  Antes (origen):  LBA inicio=2048, LBA tamaño=976.769.023  (488 GB)
-  Después (destino): LBA inicio=2048, LBA tamaño=490.000.000 (234 GB)
-```
-
-## Fase 4: Copia sparse — cómo se ve el bitmap
-
-```
-Bitmap simplificado (cada ▓ = 1.000 clusters = 4 MB):
-
-Posición:  0%        37%                    100% del volumen origen
-           │         │                      │
-Bitmap:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-                    DATOS (180 GB)                     LIBRE (308 GB)
-                    se copian                          se saltan
-
-Operación de I/O por run (ejemplo de runs reales):
-  Run 1:  clusters 0-999.999    → 1 run de 4 GB    → 1 ReadFile + 1 WriteFile
-  Run 2:  clusters 1.000.000-1.499.999 → 2 GB      → 1 ReadFile + 1 WriteFile
-  (gap de clusters libres: 1.500.000-1.700.000 → SKIP)
-  Run 3:  clusters 1.700.001-2.999.999 → 5 GB      → 1 ReadFile + 1 WriteFile
-  ...
-  Último run termina en cluster ~45.800.000
-  Todo lo que viene después: clusters 45.800.001 a 122.096.127 → SKIP total
-
-Total reads/writes en este ejemplo:
-  Si los datos son relativamente contiguos (típico en NTFS):
-    ~50-200 runs → 50-200 pares de ReadFile/WriteFile para 180 GB
-  Si muy fragmentado: podría ser miles de runs, pero sigue siendo
-    solo 180 GB de datos transferidos
-```
-
-## Fase 5: Parche del boot sector NTFS
-
-```
-Leer sector LBA 2048 del DISCO DESTINO (= inicio de la partición)
-Los primeros 512 bytes contienen el BPB de NTFS.
-
-Verificar que es NTFS: bytes 3-10 deben ser "NTFS    " (con 4 espacios)
-
-Offset 0x28 (byte 40): campo TotalSectors
-  ANTES (copiado del origen):  976.769.023  (en little-endian: 3F 4F C2 3A 00 00 00 00)
-  NUEVO (tamaño del destino):  490.000.000  (en little-endian: 40 3A 33 1D 00 00 00 00)
-
-Acción: escribir los 8 bytes nuevos en offset 40 del boot sector.
-Resultado: NTFS del destino cree que el volumen tiene 234 GB. Correcto.
-```
-
-## Resultado final Ejemplo 1
-
-```
-✓ 180 GB de datos copiados (de 488 GB que tenía el origen)
-✓ 308 GB de espacio libre NO copiados (ahorro de tiempo y compatibilidad con disco chico)
-✓ Disco destino de 250 GB con partición NTFS de 234 GB
-✓ Windows reconoce el filesystem como sano (TotalSectors correcto)
-✓ ~16 GB sin asignar al final (el usuario puede extender o dejar así)
-
-Tiempo estimado a 300 MB/s:
-  Clone viejo: 488 GB / 300 MB/s = 27 minutos
-  Clone nuevo: 180 GB / 300 MB/s = 10 minutos
-```
-
----
-
----
-
-# EJEMPLO 2 — 298 GB origen, 246 GB usados → destino 256 GB (caso justo)
-
-## Datos del ejemplo
-
-Este ejemplo es deliberadamente difícil: los datos casi llenan el origen
-y el destino es solo un poco más grande que los datos usados.
-
-```
-DISCO ORIGEN: 298 GB físicos (el del usuario)
-  Sectores totales:   618.475.520  (298 GB / 512)
-  Tabla: MBR o GPT
+DISCO ORIGEN: 500 GB (base 10) = 500.000.000.000 bytes
+  Sectores totales: 976.562.500   (500e9 / 512)
+  Tabla: MBR
 
   Partición única NTFS:
-    Inicio: LBA 2048
-    Cluster size: 4096 bytes
-    Total clusters: ~77.308.416
-    Usados: ~64.000.000  (246 GB / 4096)
-    Libres: ~13.308.416  (51 GB de espacio libre)
-    Último cluster con datos: #63.900.000
-    
-    IMPORTANTE: los datos están dispersos por casi todo el disco.
-    El último cluster usado está en la posición 82% del volumen.
+    Inicio: LBA 2048 (offset 1.048.576 bytes)
+    Tamaño: ~976.560.000 sectores ≈ 499,9 GB
+    Cluster: 4096 bytes → ~122.070.000 clusters
+    Usados:  ~44.000.000 clusters ≈ 180 GB
+    Último cluster usado: #45.800.000  (posición ~37% del volumen)
 
-DISCO DESTINO: 256 GB físicos
-  Sectores totales: 536.870.912  (256 GB / 512)
+DISCO DESTINO: 250 GB = 250.000.000.000 bytes (488.281.250 sectores)
 ```
 
-## Fase 1: Análisis — caso justo
-
+Análisis:
 ```
-Bitmap recibido:
-  último cluster usado = #63.900.000
+min_required = (45.800.000 + 1) × 4096 + 4096 ≈ 187,6 GB
+¿1 MB de offset + 187,6 GB cabe en 250 GB? → SÍ
 
-Cálculo mínimo:
-  min_data  = 63.900.000 × 4096 = 261.734.400.000 bytes = 243.8 GB
-  overhead  = 5%  = +12.2 GB
-  min_total = 256 GB
-
-¿Entra en 256 GB? 256 GB = 256 GB → ⚠ EXACTO — muy justo
-
-Decisión del algoritmo:
-  Si min_total > dest_size → ERROR
-  Si min_total <= dest_size → PROCEDER (aunque sea justo)
-
-  En este caso:
-    min_total = 256.000.000.000 bytes (256 GB con overhead)
-    dest_size = 274.877.906.944 bytes (256 GiB = 256 × 2^30, en realidad más)
-
-  NOTA: 256 GB del disco ≠ 256 GiB.
-  Disco "256 GB" físico = 256.000.000.000 bytes (fabricante usa base 10)
-  256 GiB = 274.877.906.944 bytes
-
-  Si el destino es 256 GB (base 10): 256.000.000.000 bytes
-    min_total con 5% = 261.734.400.000 × 1.05 = 274.820.000.000 ≈ 274 GB
-    274 GB > 256 GB → ✗ NO CABE
-
-  Si el destino es 256 GiB (274 GB reales):
-    274.820.000.000 < 274.877.906.944 → ✓ CABE (por muy poco)
+A copiar: 180 GB (los ~320 GB de clusters libres se saltan)
+Clone viejo: 500 GB → ~28 min a 300 MB/s
+Clone nuevo: 180 GB → ~10 min a 300 MB/s
 ```
 
-## Revisión del cálculo — problema encontrado
-
+Caso límite — mismos 180 GB de datos pero fragmentados hasta el final del disco:
 ```
-PROBLEMA DETECTADO al revisar el ejemplo:
+Último cluster usado: #120.000.000 (posición ~98% del volumen)
+min_required = 120.000.001 × 4096 ≈ 491,5 GB → NO cabe en 250 GB
 
-  Los datos usan 246 GB del disco. 
-  El último cluster con datos está en la posición 82% del disco origen.
-  Mínimo necesario = posición del último cluster × cluster_size = 243.8 GB
-  Con 5% overhead = 256 GB
-
-  Un disco destino de exactamente 256 GB (base 10) = 256.000.000.000 bytes
-  El overhead del 5% excede el disco.
-
-SOLUCIÓN: el overhead del 5% es demasiado agresivo para casos donde los
-datos casi llenan el origen. Mejor calcular overhead fijo:
-
-  min_required = posición_último_cluster_usado + (cluster_size × 1000)
-                  ↑ espacio de datos exacto     ↑ solo 4 MB de margen
-
-  Y la partición en el destino se dimensiona para llenar el disco disponible,
-  no para tener exactamente el mínimo.
-
-CORRECCIÓN en el algoritmo:
-  min_required = (ultimo_cluster + 1) × cluster_size  ← sin overhead
-  Si min_required > dest_disk_size → ERROR
-  Si min_required <= dest_disk_size → OK, la partición usa TODO el destino
+Mensaje al usuario:
+  "Los datos ocupan 180 GB pero están distribuidos hasta el 98% del disco
+   origen. Esta técnica no los puede reubicar. Opciones:
+     · Desfragmentar/optimizar el origen (defrag X: /X consolida hacia el inicio)
+     · Usar un disco destino de al menos 500 GB"
 ```
 
-## Ejemplo 2 corregido con nueva lógica
-
-```
-Datos reales:
-  último cluster = #63.900.000
-  min_required   = 63.900.001 × 4096 = 261.734.404.096 bytes = 243.8 GB exacto
-
-  Disco destino de "256 GB" físicos = 256.000.000.000 bytes (base 10)
-
-  ¿243.8 GB cabe en 256 GB? ✓ SÍ — sobran ~12 GB
-
-Nuevo layout del destino:
-  Partición: LBA 2048 hasta el final del disco ← usa TODO el espacio disponible
-  Tamaño partición = 256.000.000.000 - (2048 × 512) = 254.950.424.576 bytes
-                   = 497.168.798 sectores
-
-Parche NTFS:
-  TotalSectors = 497.168.798 (en lugar de 618.473.472 del origen)
-
-Resultado:
-  ✓ Los 246 GB de datos caben
-  ✓ La partición ocupa todo el disco destino (~244 GB)
-  ✓ Quedan ~12 GB disponibles dentro de la partición (espacio libre NTFS)
-  ✓ No hay espacio sin asignar (la partición ya ocupa todo el disco)
-```
-
-## Caso imposible — para comparar
-
-```
-Si el último cluster con datos estuviera en la posición 98% del volumen:
-  último cluster = #75.760.000 (de 77.308.416 totales)
-  min_required   = 75.760.001 × 4096 = 310.313.988.096 bytes = 289 GB
-
-  ¿289 GB cabe en 256 GB? ✗ NO
-
-  Mensaje al usuario:
-  ─────────────────────────────────────────────────────
-  Los datos están distribuidos hasta los últimos sectores
-  del origen. Mínimo necesario: 289 GB.
-  El disco destino tiene 256 GB → no es posible clonar.
-  
-  Opciones:
-    · Usar un disco destino de al menos 300 GB
-    · Desfragmentar el disco origen primero (consolida
-      los datos hacia el inicio, reduce el "último cluster")
-  ─────────────────────────────────────────────────────
-```
+**Por qué el mínimo es la POSICIÓN del último cluster y no la SUMA de datos:**
+cada cluster se copia a su mismo LCN en el destino. No podemos compactarlos:
+habría que reescribir todas las referencias internas del filesystem, que es
+exactamente lo que hace un desfragmentador. Por eso la fragmentación define el
+mínimo. Y por eso NO se aplica un "overhead %": el mínimo es exacto, y la
+versión anterior de este plan (5% de holgura) hacía fallar casos que sí caben.
 
 ---
 
+## 8. Riesgos críticos y decisiones abiertas
+
+### 8.1 ⚠ EL RIESGO PRINCIPAL: metadata interna inconsistente (Estrategia A)
+
+Parchear el boot sector le dice al FS "ahora medís X sectores", pero la
+metadata interna sigue describiendo el tamaño original:
+
+- **NTFS**: el archivo `$Bitmap` tiene 1 bit por cluster del volumen ORIGINAL
+  (más grande). Resultado típico: el volumen monta pero chkdsk encuentra
+  errores, o directamente el driver se niega a montarlo.
+- **FAT32**: la tabla FAT tiene entradas para todos los clusters originales y
+  `FATSz32` del BPB sigue declarando el tamaño viejo.
+- **exFAT**: ídem con su allocation bitmap.
+
+Mitigación planificada: `chkdsk /f` automático post-clone (paso 15), que
+reconstruye/trunca metadata. **Hay que VALIDAR EN PRUEBAS REALES que chkdsk
+repara esto de forma confiable en los tres filesystems antes de dar la feature
+por buena** (clonar → chkdsk → montar → comparar hashes de archivos). Si chkdsk
+no lo repara de forma consistente, la Estrategia A no es viable tal cual y hay
+que ir a la B.
+
+### 8.2 Consistencia durante la copia
+
+El bitmap y los datos se leen de un volumen montado que puede estar cambiando
+mientras copiamos. Plan: `FSCTL_LOCK_VOLUME` sobre el origen durante toda la
+copia (falla si hay archivos abiertos). Si el lock falla: advertir y dejar
+elegir entre continuar (riesgo de copia inconsistente) o abortar. VSS
+(snapshot) sería la solución perfecta pero queda fuera de alcance por
+complejidad.
+
+**Nota**: esto también aplica al clone sector-a-sector ACTUAL (hoy copia el
+origen montado y caliente). Vale la pena agregar el lock del origen al clone
+actual independientemente de este plan.
+
+### 8.3 Clones booteables
+
+Ya hoy se cambia la firma del disco destino (uniqueid) para evitar la colisión
+de firmas. El BCD de Windows referencia el dispositivo de arranque por firma de
+disco + offset de partición → **un clon de un disco de sistema puede no
+bootear** sin un `bcdboot`/`bootrec /rebuildbcd` posterior. No es regresión de
+este plan (ya pasa hoy con el clone actual), pero hay que documentarlo en la
+UI: "clonar disco de datos: OK; disco de Windows: puede requerir reparación de
+arranque".
+
+### 8.4 Alcance v1 (decisiones propuestas)
+
+1. **Solo se encoge la ÚLTIMA partición.** Las demás se copian idénticas
+   (offset y tamaño). Layouts con Recovery DESPUÉS de C: (muy comunes en
+   equipos de fábrica) → v1 ofrece omitir la partición Recovery (checkbox con
+   aviso) o aborta. Reubicar particiones queda para v2.
+2. **MBR y GPT soportados desde v1** vía Initialize-Disk/New-Partition
+   (Windows escribe la tabla, §4) — la complejidad de CRC32/backup header
+   desaparece.
+3. **Particiones sin letra** (EFI, MSR, Recovery): sector a sector, tamaño
+   original. Si no caben en el destino → error claro.
+4. **BitLocker**: detectado → solo se ofrece el clone clásico (destino >= origen).
+5. **Discos 4Kn**: si el tamaño de sector lógico difiere entre origen y
+   destino → abortar.
+
 ---
 
-# Resumen de lo que hay que revisar antes de implementar
+## 9. Estrategia B: encoger origen → clonar → restaurar
 
-## Puntos confirmados ✓
+La alternativa con menos código y filesystem garantizado consistente:
 
-1. `FSCTL_GET_VOLUME_BITMAP` → código 0x0009006F, funciona en volúmenes montados
-2. NTFS TotalSectors → offset 0x28 (40 bytes desde inicio del boot sector)
-3. FAT32 TotalSectors32 → offset 0x20 (32 bytes)
-4. exFAT VolumeLength → offset 0x48 (72 bytes), en clusters no sectores
-5. MBR: LBA tamaño de partición → offset 12 dentro de cada entrada de 16 bytes
-6. Bitmap: bit N del cluster N = buffer[N/8] >> (N%8) & 1
-7. Offset físico de cluster N = partition_offset_lba×512 + N×cluster_size
-8. El algoritmo de "último cluster usado" basta para saber el mínimo
-9. Sin overhead % — la partición destino usa TODO el espacio disponible
-10. Para SetFilePointerEx: necesario para seeks en el disco (leer/escribir en offset)
+```
+1. ANÁLISIS: Get-PartitionSupportedSize en el origen → SizeMin
+   (Windows ya calcula el mínimo encogible, considerando archivos inamovibles)
 
-## Puntos que necesitan decisión antes de implementar
+2. Si SizeMin (+ offsets) <= tamaño del destino:
+   a. Resize-Partition origen → SizeMin + margen      ← Windows reubica
+      clusters y mantiene TODO consistente ($Bitmap, FAT, boot sector, backups)
+   b. Clonar sector a sector SOLO hasta el fin de la última partición
+      (el código actual con un parámetro de límite de bytes — cambio mínimo)
+   c. Restaurar el origen: Resize-Partition de vuelta al máximo
+   d. El destino NO necesita parches: la tabla de particiones clonada describe
+      la partición YA encogida, que es válida tal cual en el disco chico.
+      Solo corre el post-proceso actual (firma nueva, online, expandir).
 
-1. **GPT backup header**: disco GPT tiene copia de la tabla al final.
-   Al moverla al nuevo final del disco hay que recalcular CRC32.
-   → ¿Soportamos GPT en v1 o solo MBR?
+3. Si SizeMin > destino: mismo mensaje de error, con la opción de
+   desfragmentar o deshabilitar pagefile/hibernación y reintentar.
+```
 
-2. **Múltiples particiones**: ¿qué pasa si el origen tiene C: + D: + Recovery?
-   → ¿Copiamos todas las particiones o solo la principal?
+**Pros**: ~90% del código ya existe; el resultado monta sin chkdsk; MBR/GPT,
+boot sectors y backups quedan todos bien porque nunca se inventa nada a mano.
 
-3. **Volúmenes sin letra** (Recovery, EFI): no se puede abrir \\.\X: sin letra.
-   → Se copian sector a sector (tamaño original). Si el destino es más chico
-     y estas particiones no caben, bloqueamos con error.
+**Contras**: escribe en el disco origen (shrink + grow, reversible pero es
+escritura); si se corta la energía durante el shrink/grow el origen puede
+quedar a medias; `SizeMin` suele ser peor que "último cluster usado" porque
+los archivos inamovibles (pagefile.sys, hiberfil.sys, $MFT mirror) limitan el
+shrink — mitigable deshabilitándolos temporalmente, pero suma pasos y reinicios.
 
-4. **BitLocker**: FSCTL_GET_VOLUME_BITMAP puede fallar o dar resultados incorrectos.
-   → Detectar y reportar como "no se puede analizar, clonar requiere destino >= origen"
-
-5. **¿analyze_clone como comando separado?**: 
-   La UI debería mostrar el análisis ANTES de que el usuario presione "Iniciar".
-   Necesita un comando Rust que NO clone, solo analice y devuelva los números.
+**Criterio de decisión**: correr `Get-PartitionSupportedSize` en los discos
+reales de los casos de uso típicos. Si el SizeMin típico alcanza para los
+destinos típicos → implementar B. Si no → invertir en A.
 
 ---
 
-# Orden de implementación cuando se decida proceder
+## 10. Orden de implementación (Estrategia A, si se elige)
 
 ```
-1. Agregar SetFilePointerEx y FSCTL_GET_VOLUME_BITMAP a disk_win mod
-2. Implementar get_volume_bitmap(letter) → VolumeBitmap
-3. Implementar last_used_cluster(bitmap) → u64
-4. Implementar analyze_clone command (solo análisis, sin copiar)
-5. Actualizar CloneDisk.jsx para mostrar análisis en tiempo real
-6. Implementar copy_sparse()
-7. Implementar patch_boot_sector()
-8. Modificar clone_disk_blocking para elegir modo según origen/destino
-9. Manejar múltiples particiones
-10. Manejar GPT (CRC32 del backup header)
-11. Tests con discos reales
+ 1. Validaciones fase 0 (BitLocker, dirty bit, tamaño de sector)
+ 2. Agregar FSCTL_GET_VOLUME_BITMAP + SetFilePointerEx a disk_win
+ 3. get_volume_bitmap() con loop ERROR_MORE_DATA + prueba con volumen real
+ 4. last_used_cluster() + comando analyze_clone (solo análisis)
+ 5. UI de análisis en CloneDisk.jsx (desglose por partición, can_fit)
+ 6. Fase 3 con Initialize-Disk/New-Partition
+ 7. copy_sparse() con lock de volumen, chunks y progreso
+ 8. patch_boot_sector() NTFS (con backup boot sector) → probar → FAT32 → exFAT
+ 9. chkdsk /f automático post-clone + verificación de montaje
+10. PRUEBA CRÍTICA del §8.1 con discos reales en los 3 filesystems
+    (clonar → chkdsk → montar → comparar hashes de archivos)
+11. Multi-partición + caso Recovery-después-de-C:
 ```
+
+Para la Estrategia B el orden es trivial: analyze con SizeMin → shrink →
+parámetro de límite de bytes en el clone actual → grow → post-proceso existente.

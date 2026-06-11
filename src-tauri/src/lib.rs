@@ -612,6 +612,74 @@ fn clone_disk_blocking(
         }
     };
 
+    // DISK_GEOMETRY_EX: 24 bytes (DISK_GEOMETRY) + 8 bytes (DiskSize i64) + resto.
+    // Buffer raw de 64 bytes, DiskSize en el offset 24.
+    let read_disk_size = |handle: *mut c_void| -> Option<u64> {
+        let mut buf = [0u8; 64];
+        let mut bytes_returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(i64::from_ne_bytes(buf[24..32].try_into().unwrap()) as u64)
+    };
+
+    // ── Paso 0: validar TODO antes de tocar el destino ──────────────────────
+    // Clear-Disk es destructivo e irreversible: hasta no confirmar que el origen
+    // se puede abrir y que el destino es lo bastante grande, no se modifica nada.
+    let _ = app.emit("clone-status", CloneStatus {
+        message: "Verificando discos...".to_string(),
+    });
+
+    let src_handle = open_disk(source_index, false)?;
+
+    let disk_size = match read_disk_size(src_handle) {
+        Some(s) => s,
+        None => {
+            unsafe { CloseHandle(src_handle); }
+            return Err("No se pudo obtener el tamaño del disco origen".to_string());
+        }
+    };
+
+    {
+        let probe = match open_disk(dest_index, false) {
+            Ok(h) => h,
+            Err(e) => {
+                unsafe { CloseHandle(src_handle); }
+                return Err(e);
+            }
+        };
+        let dest_size = read_disk_size(probe);
+        unsafe { CloseHandle(probe); }
+        match dest_size {
+            None => {
+                unsafe { CloseHandle(src_handle); }
+                return Err("No se pudo obtener el tamaño del disco destino".to_string());
+            }
+            Some(d) if d < disk_size => {
+                unsafe { CloseHandle(src_handle); }
+                return Err(format!(
+                    "El disco destino ({:.1} GB) es más chico que el origen ({:.1} GB). \
+                     Clonación abortada — el destino no fue modificado.",
+                    d as f64 / 1e9,
+                    disk_size as f64 / 1e9
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
     // ── Paso 1: limpiar el disco destino ────────────────────────────────────
     // Elimina todas las particiones y el MBR/GPT del destino. Esto garantiza
     // que no haya volúmenes montados que bloqueen las escrituras posteriores.
@@ -628,6 +696,7 @@ fn clone_disk_blocking(
         .output();
 
     if let Err(e) = clean_out {
+        unsafe { CloseHandle(src_handle); }
         return Err(format!("No se pudo ejecutar Clear-Disk: {}", e));
     }
 
@@ -637,8 +706,6 @@ fn clone_disk_blocking(
     let _ = app.emit("clone-status", CloneStatus {
         message: "Iniciando copia sector a sector...".to_string(),
     });
-
-    let src_handle = open_disk(source_index, false)?;
 
     // Desmontar todos los volúmenes del disco destino antes de escribir.
     // Windows bloquea escrituras en un disco físico si tiene volúmenes montados.
@@ -679,31 +746,6 @@ fn clone_disk_blocking(
             for vh in &vol_handles { unsafe { CloseHandle(*vh); } }
             return Err(e);
         }
-    };
-
-    // DISK_GEOMETRY_EX: 24 bytes (DISK_GEOMETRY) + 8 bytes (DiskSize i64) + resto
-    // Usamos buffer raw de 64 bytes y leemos DiskSize desde offset 24
-    let disk_size = {
-        let mut buf = [0u8; 64];
-        let mut bytes_returned: u32 = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                src_handle,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                std::ptr::null(),
-                0,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut bytes_returned,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            unsafe { CloseHandle(src_handle); CloseHandle(dst_handle); }
-            return Err("No se pudo obtener el tamaño del disco origen".to_string());
-        }
-        // DiskSize está a 24 bytes del inicio (después de DISK_GEOMETRY)
-        i64::from_ne_bytes(buf[24..32].try_into().unwrap()) as u64
     };
 
     // FILE_FLAG_NO_BUFFERING requiere:
@@ -760,6 +802,14 @@ fn clone_disk_blocking(
         if ok == 0 {
             let err = unsafe { GetLastError() };
             break Err(format!("Error de escritura en el disco destino (código Windows: {})", err));
+        }
+        // Una escritura parcial desalinearía los punteros de origen y destino:
+        // todo lo que siga se escribiría corrido → clon corrupto silencioso.
+        if bytes_written != bytes_read {
+            break Err(format!(
+                "Escritura incompleta en el disco destino ({} de {} bytes). Clonación abortada.",
+                bytes_written, bytes_read
+            ));
         }
 
         copied += (bytes_read as usize).min(to_read) as u64;
