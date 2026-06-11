@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { version } from "../package.json";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import FileBrowser from "./components/FileBrowser";
 import RobocopyPanel from "./components/RobocopyPanel";
@@ -78,12 +79,20 @@ export default function App() {
   const [copyStatus, setCopyStatus] = useState({ running: false, liveFile: null, ft: null, fileCount: 0 });
   const [cloning, setCloning]       = useState(false);
   const [showCloseWarning, setShowCloseWarning] = useState(false);
+  const [pendingClose, setPendingClose] = useState(false);
 
   // Ref para que el handler de cierre siempre lea el valor más fresco sin re-registrarse
   const operationActiveRef = useRef(false);
   useEffect(() => {
     operationActiveRef.current = copyStatus.running || cloning;
   }, [copyStatus.running, cloning]);
+
+  // Cierra la ventana cuando el proceso termina después de que el usuario confirmó cancelar
+  useEffect(() => {
+    if (pendingClose && !copyStatus.running && !cloning) {
+      getCurrentWindow().close();
+    }
+  }, [pendingClose, copyStatus.running, cloning]);
 
   // Registrar handler de cierre una sola vez
   useEffect(() => {
@@ -97,6 +106,14 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  async function handleCancelAndClose() {
+    setPendingClose(true);
+    try {
+      if (copyStatus.running) await invoke("cancel_robocopy");
+      if (cloning) await invoke("cancel_clone");
+    } catch (_) {}
+  }
+
   function handleLoadJob(job) {
     setLoadedJob({ ...job, _ts: Date.now() });
     setActiveTab("robocopy");
@@ -105,7 +122,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100 overflow-hidden">
 
-      {/* ── Modal: no se puede cerrar ────────────────────────────────────────── */}
+      {/* ── Modal: operación en curso al cerrar ──────────────────────────────── */}
       {showCloseWarning && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl">
@@ -119,15 +136,38 @@ export default function App() {
               </div>
               <p className="text-sm font-semibold text-gray-100">Operación en curso</p>
             </div>
-            <p className="text-sm text-gray-400 mb-5 leading-relaxed">
-              Hay una operación en curso. Cancelá el proceso antes de cerrar la aplicación.
-            </p>
-            <button
-              onClick={() => setShowCloseWarning(false)}
-              className="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-semibold transition-colors"
-            >
-              Entendido
-            </button>
+
+            {pendingClose ? (
+              <div className="flex items-center gap-3 py-2 text-sm text-gray-400">
+                <svg className="w-4 h-4 animate-spin shrink-0 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
+                </svg>
+                Cancelando proceso, esperando que termine...
+              </div>
+            ) : (
+              <>
+                <p className="text-sm text-gray-400 mb-5 leading-relaxed">
+                  {copyStatus.running
+                    ? "Hay una copia de Robocopy en curso."
+                    : "Hay una clonación de disco en curso."}
+                  {" "}¿Deseás cancelar el proceso y cerrar la aplicación?
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleCancelAndClose}
+                    className="flex-1 py-2 bg-red-700 hover:bg-red-600 active:bg-red-800 rounded-lg text-sm font-semibold transition-colors"
+                  >
+                    Sí, cancelar y cerrar
+                  </button>
+                  <button
+                    onClick={() => setShowCloseWarning(false)}
+                    className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-800 rounded-lg text-sm font-semibold transition-colors"
+                  >
+                    No, continuar
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
