@@ -1,7 +1,9 @@
 fn main() {
     let attrs = tauri_build::Attributes::new();
 
-    #[cfg(target_os = "windows")]
+    // En debug (tauri dev) no se requiere elevación para poder lanzar sin ser admin.
+    // En release el manifiesto exige requireAdministrator.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
     let attrs = attrs.windows_attributes(
         tauri_build::WindowsAttributes::new().app_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -13,6 +15,28 @@ fn main() {
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>"#,
+        ),
+    );
+
+    // En debug, igual se necesita Common Controls v6 para que no falle TaskDialog
+    #[cfg(all(target_os = "windows", debug_assertions))]
+    let attrs = attrs.windows_attributes(
+        tauri_build::WindowsAttributes::new().app_manifest(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
     <dependentAssembly>
       <assemblyIdentity

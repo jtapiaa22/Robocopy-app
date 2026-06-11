@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { version } from "../package.json";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./index.css";
 import FileBrowser from "./components/FileBrowser";
 import RobocopyPanel from "./components/RobocopyPanel";
 import JobHistory from "./components/JobHistory";
 import HelpPanel from "./components/HelpPanel";
+import CloneDisk from "./components/CloneDisk";
 
 const TABS = [
   {
@@ -40,6 +42,19 @@ const TABS = [
     ),
   },
   {
+    id: "clone",
+    label: "Clonar Disco",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
+        <ellipse cx="7" cy="7" rx="5" ry="2" />
+        <path d="M2 7v6c0 1.1 2.24 2 5 2s5-.9 5-2V7" />
+        <path d="M2 10c0 1.1 2.24 2 5 2s5-.9 5-2" />
+        <path d="M15 12l3 3 3-3" />
+        <path d="M18 7v8" />
+      </svg>
+    ),
+  },
+  {
     id: "help",
     label: "Guía y Actualizaciones",
     icon: (
@@ -61,14 +76,61 @@ export default function App() {
   const [loadedJob, setLoadedJob]   = useState(null);
   const [jobsVersion, setJobsVersion] = useState(0);
   const [copyStatus, setCopyStatus] = useState({ running: false, liveFile: null, ft: null, fileCount: 0 });
+  const [cloning, setCloning]       = useState(false);
+  const [showCloseWarning, setShowCloseWarning] = useState(false);
+
+  // Ref para que el handler de cierre siempre lea el valor más fresco sin re-registrarse
+  const operationActiveRef = useRef(false);
+  useEffect(() => {
+    operationActiveRef.current = copyStatus.running || cloning;
+  }, [copyStatus.running, cloning]);
+
+  // Registrar handler de cierre una sola vez
+  useEffect(() => {
+    let unlisten;
+    getCurrentWindow().onCloseRequested((event) => {
+      if (operationActiveRef.current) {
+        event.preventDefault();
+        setShowCloseWarning(true);
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
 
   function handleLoadJob(job) {
-    setLoadedJob({ ...job, _ts: Date.now() }); // _ts fuerza el useEffect aunque sea el mismo trabajo
+    setLoadedJob({ ...job, _ts: Date.now() });
     setActiveTab("robocopy");
   }
 
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100 overflow-hidden">
+
+      {/* ── Modal: no se puede cerrar ────────────────────────────────────────── */}
+      {showCloseWarning && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-9 h-9 rounded-full bg-yellow-500/15 flex items-center justify-center shrink-0">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-5 h-5 text-yellow-400">
+                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                  <line x1="12" y1="9" x2="12" y2="13" />
+                  <line x1="12" y1="17" x2="12.01" y2="17" />
+                </svg>
+              </div>
+              <p className="text-sm font-semibold text-gray-100">Operación en curso</p>
+            </div>
+            <p className="text-sm text-gray-400 mb-5 leading-relaxed">
+              Hay una operación en curso. Cancelá el proceso antes de cerrar la aplicación.
+            </p>
+            <button
+              onClick={() => setShowCloseWarning(false)}
+              className="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-semibold transition-colors"
+            >
+              Entendido
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Barra de título ──────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between px-5 py-2.5 bg-gray-900 border-b border-gray-800 shrink-0">
@@ -120,7 +182,6 @@ export default function App() {
                 : "border-transparent text-gray-500 hover:text-gray-300 hover:bg-gray-800/50"}`}>
             {tab.icon}
             {tab.label}
-            {/* Badge pulsante cuando hay copia corriendo */}
             {tab.id === "robocopy" && copyStatus.running ? (
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
@@ -139,7 +200,6 @@ export default function App() {
           onClick={() => setActiveTab("robocopy")}
           className="flex items-center gap-3 px-4 py-2 bg-blue-950/70 border-b border-blue-900/50 text-xs w-full hover:bg-blue-950/90 transition-colors shrink-0 group"
         >
-          {/* Indicador pulsante */}
           <span className="relative flex h-2 w-2 shrink-0">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
@@ -149,21 +209,17 @@ export default function App() {
 
           {copyStatus.liveFile?.name ? (
             <>
-              {/* Badge del tipo de archivo */}
               {copyStatus.ft && (
                 <span className={`${copyStatus.ft.bg} ${copyStatus.ft.fg} px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shrink-0`}>
                   {copyStatus.ft.short}
                 </span>
               )}
-              {/* Nombre */}
               <span className="text-gray-300 truncate max-w-[220px]">{copyStatus.liveFile.name}</span>
-              {/* Directorio */}
               {copyStatus.liveFile.dir && (
                 <span className="text-gray-600 truncate max-w-[180px] font-mono hidden lg:block">
                   {copyStatus.liveFile.dir}
                 </span>
               )}
-              {/* Barra + porcentaje */}
               <div className="flex items-center gap-2 ml-auto shrink-0">
                 <div className="relative h-1 w-28 bg-blue-900/60 rounded-full overflow-hidden">
                   <div
@@ -182,7 +238,6 @@ export default function App() {
             </span>
           )}
 
-          {/* Hint "ir a ver" */}
           <span className="text-blue-700 group-hover:text-blue-500 transition-colors shrink-0 ml-1">
             Ver detalles →
           </span>
@@ -219,6 +274,9 @@ export default function App() {
         </div>
         <div className={activeTab === "history" ? "h-full" : "hidden h-full"}>
           <JobHistory onLoadJob={handleLoadJob} jobsVersion={jobsVersion} />
+        </div>
+        <div className={activeTab === "clone" ? "h-full" : "hidden h-full"}>
+          <CloneDisk onCloningChange={setCloning} />
         </div>
         <div className={activeTab === "help" ? "h-full" : "hidden h-full"}>
           <HelpPanel />

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 // AsyncReadExt se importa dentro de stream_output para no contaminar el scope global
 use tokio::process::Command;
@@ -44,7 +44,32 @@ struct ProcessState {
     cancelled: AtomicBool,
 }
 
+struct CloneState {
+    cancel: Arc<AtomicBool>,
+}
+
 // ─── Estructuras de datos ────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PartitionInfo {
+    letter: Option<String>,
+    size: u64,
+    label: String,
+    fs: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiskInfo {
+    index: u32,
+    model: String,
+    size: u64,
+    #[serde(rename = "isSystem")]
+    is_system: bool,
+    #[serde(rename = "isBoot")]
+    is_boot: bool,
+    style: String,
+    partitions: Vec<PartitionInfo>,
+}
 
 #[derive(Serialize, Clone)]
 struct FileEntry {
@@ -369,6 +394,477 @@ fn cancel_robocopy(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ─── Comandos: enumeración de discos físicos ─────────────────────────────────
+
+#[tauri::command]
+async fn list_disks() -> Result<Vec<DiskInfo>, String> {
+    let ps_script = r#"
+$result = @(Get-Disk | ForEach-Object {
+    $disk = $_
+    $parts = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue | ForEach-Object {
+        $vol = Get-Volume -Partition $_ -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            letter = if ($_.DriveLetter -and $_.DriveLetter -ne [char]0) { [string]$_.DriveLetter } else { $null }
+            size   = [long]$_.Size
+            label  = if ($vol) { [string]$vol.FileSystemLabel } else { '' }
+            fs     = if ($vol) { [string]$vol.FileSystem } else { '' }
+        }
+    })
+    [PSCustomObject]@{
+        index      = [int]$disk.Number
+        model      = [string]$disk.FriendlyName
+        size       = [long]$disk.Size
+        isSystem   = [bool]$disk.IsSystem
+        isBoot     = [bool]$disk.IsBoot
+        style      = [string]$disk.PartitionStyle
+        partitions = $parts
+    }
+})
+$result | ConvertTo-Json -Depth 4 -Compress
+"#;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(vec![]);
+    }
+
+    // PowerShell devuelve objeto (no array) cuando hay un solo disco — normalizar
+    let val: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Parse error: {e}"))?;
+
+    let arr = match val {
+        serde_json::Value::Array(a) => a,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => return Ok(vec![]),
+    };
+
+    Ok(arr.into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
+// ─── Comandos: clonado de disco ───────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct CloneProgress {
+    copied: u64,
+    total: u64,
+    #[serde(rename = "speedMbps")]
+    speed_mbps: f64,
+    #[serde(rename = "etaSeconds")]
+    eta_seconds: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct CloneStatus {
+    message: String,
+}
+
+#[tauri::command]
+fn cancel_clone(state: tauri::State<'_, CloneState>) {
+    state.cancel.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+async fn start_clone(
+    source_index: u32,
+    dest_index: u32,
+    dest_letters: Vec<String>,
+    expand_partition: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CloneState>,
+) -> Result<(), String> {
+    state.cancel.store(false, Ordering::Relaxed);
+    let cancel = state.cancel.clone();
+
+    tokio::task::spawn_blocking(move || {
+        clone_disk_blocking(source_index, dest_index, dest_letters, expand_partition, app, cancel)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// Declaraciones explícitas de las API de Windows para I/O de disco
+// (evita depender de qué features específicas exporta cada versión de windows-sys)
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+mod disk_win {
+    use std::ffi::c_void;
+
+    pub const GENERIC_READ: u32           = 0x80000000;
+    pub const GENERIC_WRITE: u32          = 0x40000000;
+    pub const FILE_SHARE_READ: u32        = 0x00000001;
+    pub const FILE_SHARE_WRITE: u32       = 0x00000002;
+    pub const OPEN_EXISTING: u32          = 3;
+    pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+    pub const FILE_FLAG_WRITE_THROUGH: u32= 0x80000000;
+    // DeviceIoControl code para obtener geometría + tamaño del disco
+    pub const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x000700a0;
+    // Para desmontar volúmenes del destino antes de escribir
+    pub const FSCTL_LOCK_VOLUME: u32     = 0x00090018;
+    pub const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetLastError() -> u32;
+
+        pub fn CreateFileW(
+            lpfilename: *const u16,
+            dwdesiredaccess: u32,
+            dwsharemode: u32,
+            lpsecurityattributes: *const c_void,
+            dwcreationdisposition: u32,
+            dwflagsandattributes: u32,
+            htemplatefile: *mut c_void,
+        ) -> *mut c_void;
+
+        pub fn ReadFile(
+            hfile: *mut c_void,
+            lpbuffer: *mut c_void,
+            nnumberofbytestoread: u32,
+            lpnumberofbytesread: *mut u32,
+            lpoverlapped: *mut c_void,
+        ) -> i32;
+
+        pub fn WriteFile(
+            hfile: *mut c_void,
+            lpbuffer: *const c_void,
+            nnumberofbytestowrite: u32,
+            lpnumberofbyteswritten: *mut u32,
+            lpoverlapped: *mut c_void,
+        ) -> i32;
+
+        pub fn CloseHandle(hobject: *mut c_void) -> i32;
+
+        pub fn DeviceIoControl(
+            hdevice: *mut c_void,
+            dwiocontrolcode: u32,
+            lpinbuffer: *const c_void,
+            ninbuffersize: u32,
+            lpoutbuffer: *mut c_void,
+            noutbuffersize: u32,
+            lpbytesreturned: *mut u32,
+            lpoverlapped: *mut c_void,
+        ) -> i32;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clone_disk_blocking(
+    source_index: u32,
+    dest_index: u32,
+    dest_letters: Vec<String>,
+    expand_partition: bool,
+    app: tauri::AppHandle,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    use std::ffi::c_void;
+    use std::time::Instant;
+    use disk_win::*;
+
+    let invalid: *mut c_void = (-1isize) as *mut c_void;
+
+    let open_disk = |index: u32, write: bool| -> Result<*mut c_void, String> {
+        let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{}\0", index)
+            .encode_utf16()
+            .collect();
+        let access = if write { GENERIC_READ | GENERIC_WRITE } else { GENERIC_READ };
+        let flags = FILE_FLAG_NO_BUFFERING | if write { FILE_FLAG_WRITE_THROUGH } else { 0 };
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == invalid {
+            let err = unsafe { GetLastError() };
+            Err(format!(
+                "No se pudo abrir PhysicalDrive{} (error {}). ¿Está conectado y la app corre como administrador?",
+                index, err
+            ))
+        } else {
+            Ok(handle)
+        }
+    };
+
+    // ── Paso 1: limpiar el disco destino ────────────────────────────────────
+    // Elimina todas las particiones y el MBR/GPT del destino. Esto garantiza
+    // que no haya volúmenes montados que bloqueen las escrituras posteriores.
+    let _ = app.emit("clone-status", CloneStatus {
+        message: "Preparando disco destino (limpiando particiones)...".to_string(),
+    });
+
+    let clean_script = format!(
+        "Clear-Disk -Number {} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction SilentlyContinue",
+        dest_index
+    );
+    let clean_out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &clean_script])
+        .output();
+
+    if let Err(e) = clean_out {
+        return Err(format!("No se pudo ejecutar Clear-Disk: {}", e));
+    }
+
+    // Pequeña pausa para que Windows actualice la vista del disco
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let _ = app.emit("clone-status", CloneStatus {
+        message: "Iniciando copia sector a sector...".to_string(),
+    });
+
+    let src_handle = open_disk(source_index, false)?;
+
+    // Desmontar todos los volúmenes del disco destino antes de escribir.
+    // Windows bloquea escrituras en un disco físico si tiene volúmenes montados.
+    // Guardamos los handles abiertos para mantener el lock durante toda la clonación.
+    let mut vol_handles: Vec<*mut c_void> = Vec::new();
+    for letter in &dest_letters {
+        if letter.is_empty() { continue; }
+        let vol_path: Vec<u16> = format!("\\\\.\\{}:\0", letter).encode_utf16().collect();
+        let vh = unsafe {
+            CreateFileW(
+                vol_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if vh != invalid {
+            let mut br: u32 = 0;
+            unsafe {
+                // Bloquear el volumen (falla si hay archivos abiertos → continuamos igual)
+                DeviceIoControl(vh, FSCTL_LOCK_VOLUME, std::ptr::null(), 0,
+                    std::ptr::null_mut(), 0, &mut br, std::ptr::null_mut());
+                // Desmontar del sistema de archivos
+                DeviceIoControl(vh, FSCTL_DISMOUNT_VOLUME, std::ptr::null(), 0,
+                    std::ptr::null_mut(), 0, &mut br, std::ptr::null_mut());
+            }
+            vol_handles.push(vh);
+        }
+    }
+
+    let dst_handle = match open_disk(dest_index, true) {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { CloseHandle(src_handle); }
+            for vh in &vol_handles { unsafe { CloseHandle(*vh); } }
+            return Err(e);
+        }
+    };
+
+    // DISK_GEOMETRY_EX: 24 bytes (DISK_GEOMETRY) + 8 bytes (DiskSize i64) + resto
+    // Usamos buffer raw de 64 bytes y leemos DiskSize desde offset 24
+    let disk_size = {
+        let mut buf = [0u8; 64];
+        let mut bytes_returned: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                src_handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            unsafe { CloseHandle(src_handle); CloseHandle(dst_handle); }
+            return Err("No se pudo obtener el tamaño del disco origen".to_string());
+        }
+        // DiskSize está a 24 bytes del inicio (después de DISK_GEOMETRY)
+        i64::from_ne_bytes(buf[24..32].try_into().unwrap()) as u64
+    };
+
+    // FILE_FLAG_NO_BUFFERING requiere:
+    //   1) tamaño del chunk múltiplo de 512
+    //   2) puntero del buffer alineado a 512 bytes
+    // Solución: over-alocar 511 bytes extra en el heap y calcular el offset alineado.
+    // Box::new(large_array) causa stack overflow porque Rust evalúa el valor en el
+    // stack antes de moverlo al heap.
+    const CHUNK: usize = 1_048_576; // 1 MB
+    let mut raw_buf = vec![0u8; CHUNK + 511];
+    let align_offset = raw_buf.as_ptr().align_offset(512);
+    // align_offset < 512, por lo que align_offset + CHUNK <= raw_buf.len() siempre
+    let mut copied: u64 = 0;
+    let start_time = Instant::now();
+    let mut last_emit = Instant::now();
+
+    let result = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break Err("Clonación cancelada por el usuario".to_string());
+        }
+
+        let remaining = disk_size.saturating_sub(copied);
+        if remaining == 0 { break Ok(()); }
+
+        let to_read = CHUNK.min(remaining as usize);
+        let aligned = ((to_read + 511) / 512) * 512;
+        let buf_slice = &mut raw_buf[align_offset..align_offset + aligned];
+
+        let mut bytes_read: u32 = 0;
+        let ok = unsafe {
+            ReadFile(
+                src_handle,
+                buf_slice.as_mut_ptr() as *mut c_void,
+                aligned as u32,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || bytes_read == 0 {
+            let err = unsafe { GetLastError() };
+            break Err(format!("Error de lectura del disco origen (código Windows: {})", err));
+        }
+
+        let mut bytes_written: u32 = 0;
+        let ok = unsafe {
+            WriteFile(
+                dst_handle,
+                buf_slice.as_ptr() as *const c_void,
+                bytes_read,
+                &mut bytes_written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            break Err(format!("Error de escritura en el disco destino (código Windows: {})", err));
+        }
+
+        copied += (bytes_read as usize).min(to_read) as u64;
+
+        if last_emit.elapsed().as_millis() >= 200 {
+            last_emit = Instant::now();
+            let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+            let speed_mbps = (copied as f64 / elapsed) / 1_048_576.0;
+            let eta_seconds = if speed_mbps > 0.0 {
+                ((disk_size - copied) as f64 / (speed_mbps * 1_048_576.0)) as u64
+            } else { 0 };
+            let _ = app.emit("clone-progress", CloneProgress {
+                copied, total: disk_size, speed_mbps, eta_seconds,
+            });
+        }
+    };
+
+    unsafe { CloseHandle(src_handle); CloseHandle(dst_handle); }
+    for vh in &vol_handles { unsafe { CloseHandle(*vh); } }
+
+    if result.is_ok() {
+        let _ = app.emit("clone-status", CloneStatus {
+            message: "Finalizando: actualizando disco destino...".to_string(),
+        });
+
+        // 1. Cambiar la firma del disco destino para que no colisione con el origen.
+        //    Windows pone offline los discos con firma duplicada (mismo MBR/GPT signature).
+        //    Usamos diskpart para asignar una nueva firma única.
+        let diskpart_script = format!(
+            "select disk {}\nuniqueid disk\nonline disk\nattributes disk clear readonly\n",
+            dest_index
+        );
+        let _ = std::process::Command::new("diskpart")
+            .args(["/s", "nul"])  // fallback: lo pasamos por stdin
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(diskpart_script.as_bytes());
+                }
+                child.wait()
+            });
+
+        // 2. Traer el disco online y quitar read-only vía PowerShell (más confiable que diskpart solo)
+        let ps_online = format!(
+            "$d = Get-Disk -Number {n} -ErrorAction SilentlyContinue; \
+             if ($d) {{ \
+               if ($d.IsOffline) {{ Set-Disk -Number {n} -IsOffline $false }}; \
+               if ($d.IsReadOnly) {{ Set-Disk -Number {n} -IsReadOnly $false }}; \
+               Update-Disk -Number {n} -ErrorAction SilentlyContinue \
+             }}",
+            n = dest_index
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_online])
+            .output();
+
+        // 3. Extender la última partición de datos al máximo del disco destino (opcional)
+        if expand_partition {
+            let _ = app.emit("clone-status", CloneStatus {
+                message: "Extendiendo partición al espacio disponible...".to_string(),
+            });
+            let ps_extend = format!(
+                "$parts = Get-Partition -DiskNumber {n} -ErrorAction SilentlyContinue \
+                 | Where-Object {{ $_.Type -notin @('Reserved','System','Recovery','Unknown') }} \
+                 | Sort-Object Offset; \
+                 if ($parts) {{ \
+                   $last = $parts | Select-Object -Last 1; \
+                   $sz = Get-PartitionSupportedSize -DiskNumber {n} -PartitionNumber $last.PartitionNumber -ErrorAction SilentlyContinue; \
+                   if ($sz -and $sz.SizeMax -gt $last.Size) {{ \
+                     Resize-Partition -DiskNumber {n} -PartitionNumber $last.PartitionNumber -Size $sz.SizeMax -ErrorAction SilentlyContinue \
+                   }} \
+                 }}",
+                n = dest_index
+            );
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_extend])
+                .output();
+        }
+
+        let _ = app.emit("clone-status", CloneStatus {
+            message: "Clonación completada. El disco destino está listo para usar.".to_string(),
+        });
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+    let _ = app.emit("clone-progress", CloneProgress {
+        copied,
+        total: disk_size,
+        speed_mbps: (copied as f64 / elapsed) / 1_048_576.0,
+        eta_seconds: 0,
+    });
+
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clone_disk_blocking(
+    _source_index: u32,
+    _dest_index: u32,
+    _dest_letters: Vec<String>,
+    _expand_partition: bool,
+    _app: tauri::AppHandle,
+    _cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    Err("Clonado de disco solo disponible en Windows".to_string())
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -380,6 +876,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessState { pid: Mutex::new(None), cancelled: AtomicBool::new(false) })
+        .manage(CloneState { cancel: Arc::new(AtomicBool::new(false)) })
         .setup(|app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -406,6 +903,9 @@ pub fn run() {
             save_job,
             load_jobs,
             delete_job,
+            list_disks,
+            start_clone,
+            cancel_clone,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar la aplicación");

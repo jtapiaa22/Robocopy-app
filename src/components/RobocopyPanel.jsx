@@ -214,6 +214,31 @@ function Stat({ label, value, color }) {
   );
 }
 
+// ─── Captura de líneas de error ─────────────────────────────────────────────
+// Robocopy puede emitir el path en la misma línea ERROR o en la línea siguiente.
+// Esta función acumula el contexto necesario en pendingErrRef y agrega entradas
+// a errorFiles solo cuando tiene el mensaje completo.
+function trackErrorLine(line, pendingErrRef, setErrorFiles) {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  if (/ERROR|FAILED/i.test(trimmed)) {
+    // Si el path ya está en esta línea (p.ej. "ERROR 5 ... Copying File C:\ruta\archivo")
+    if (/[A-Za-z]:[\\\/]|^\\\\\S/.test(trimmed)) {
+      setErrorFiles(prev => [...prev, trimmed]);
+      pendingErrRef.current = null;
+    } else {
+      // El path puede estar en la línea siguiente
+      pendingErrRef.current = trimmed;
+    }
+  } else if (pendingErrRef.current) {
+    // Esta es la línea con el path (o el mensaje de error del SO)
+    const combined = `${pendingErrRef.current}  —  ${trimmed}`;
+    setErrorFiles(prev => [...prev, combined]);
+    pendingErrRef.current = null;
+  }
+}
+
 // ─── Componente principal ────────────────────────────────────────────────────
 
 export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onDestChange, onGoToExplorer, loadedJob, onJobSaved, onStatusChange }) {
@@ -242,11 +267,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [currentDirInfo, setCurrentDirInfo] = useState(null); // { path, count, processed }
   const [cancelling, setCancelling]       = useState(false);
   const [nudgeFeedback, setNudgeFeedback] = useState(false); // feedback visual tras "desbloquear"
+  const [errorFiles, setErrorFiles]       = useState([]);
+  const [showErrors, setShowErrors]       = useState(false);
 
-  const outputRef    = useRef(null);
-  const unlistenRef  = useRef([]);
-  const lastWasCrRef = useRef(false);
-  const currentDirRef = useRef(""); // directorio actual que está procesando robocopy
+  const outputRef      = useRef(null);
+  const unlistenRef    = useRef([]);
+  const lastWasCrRef   = useRef(false);
+  const currentDirRef  = useRef(""); // directorio actual que está procesando robocopy
+  const pendingErrRef  = useRef(null); // acumula línea ERROR si el path viene en la línea siguiente
 
   // Cuando el explorador manda archivos seleccionados, pre-rellena el filtro /IF
   useEffect(() => {
@@ -354,11 +382,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     unlistenRef.current.forEach(fn => fn());
     unlistenRef.current = [];
     lastWasCrRef.current = false;
+    pendingErrRef.current = null;
     setLiveFile(null);
     setRecentFiles([]);
     setShowRawLog(false);
     setCurrentDirInfo(null);
     setCancelling(false);
+    setErrorFiles([]);
+    setShowErrors(false);
     currentDirRef.current = "";
 
     const flags = buildFlags();
@@ -374,6 +405,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           return [...prev, line];
         });
         parseSummaryLine(line);
+        // Capturar líneas de error (con soporte para path en línea siguiente)
+        trackErrorLine(line, pendingErrRef, setErrorFiles);
         // Detectar directorio actual
         const dirInfo = parseDirLine(line);
         if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
@@ -439,6 +472,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         setLiveFile(null);
         setCurrentDirInfo(null);
         setCancelling(false);
+        if (worst >= 8) setShowErrors(true);
         unlistenRef.current.forEach(fn => fn());
         unlistenRef.current = [];
         await sendDoneNotification(worst);
@@ -470,6 +504,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         return [...prev, line];
       });
       parseSummaryLine(line);
+      trackErrorLine(line, pendingErrRef, setErrorFiles);
       const dirInfo = parseDirLine(line);
       if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
       if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
@@ -517,6 +552,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       setLiveFile(null);
       setCurrentDirInfo(null);
       setCancelling(false);
+      if (code >= 8) setShowErrors(true);
       unlistenRef.current.forEach(fn => fn());
       unlistenRef.current = [];
       await sendDoneNotification(code);
@@ -882,6 +918,40 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       {/* ── Tarjeta de resumen (al terminar) ───────────────────────────────── */}
       {summary && exitCode !== null && !running && (
         <SummaryCard summary={summary} exitCode={exitCode} />
+      )}
+
+      {/* ── Panel de errores (al terminar con código >= 8) ──────────────────── */}
+      {!running && errorFiles.length > 0 && (
+        <div className="mx-4 mb-2">
+          <button
+            onClick={() => setShowErrors(p => !p)}
+            className="flex items-center justify-between w-full px-3 py-2 bg-red-950/30 border border-red-900/50 rounded-lg text-xs text-red-400 hover:bg-red-950/50 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5 shrink-0">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <span>{errorFiles.length} entrada{errorFiles.length !== 1 ? "s" : ""} con error — click para ver</span>
+            </div>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+              className={`w-3 h-3 transition-transform duration-200 ${showErrors ? "rotate-180" : ""}`}>
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
+          {showErrors && (
+            <div className="mt-1 bg-gray-950 border border-red-900/30 rounded-lg overflow-hidden">
+              <div className="max-h-56 overflow-y-auto p-3 space-y-1.5">
+                {errorFiles.map((entry, i) => (
+                  <div key={i} className="font-mono text-xs text-red-400 selectable leading-relaxed break-all border-l-2 border-red-900/50 pl-2">
+                    {entry}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       )}
 
       {/* ── Toggle + Log raw ───────────────────────────────────────────────── */}
