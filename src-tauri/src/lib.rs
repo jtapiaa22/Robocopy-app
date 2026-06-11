@@ -437,7 +437,8 @@ $result | ConvertTo-Json -Depth 4 -Compress
     }
 
     let output = cmd.output().await.map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // PowerShell emite en el code page de consola: decodificar como el resto de salida CMD
+    let stdout = decode_cmd_output(&output.stdout);
     let trimmed = stdout.trim();
 
     if trimmed.is_empty() || trimmed == "null" {

@@ -190,6 +190,7 @@ export default function CloneDisk({ onCloningChange }) {
   }, [cloning]);
 
   const canStart = source && dest && !source.isSystem && !source.isBoot
+    && !dest.isSystem && !dest.isBoot
     && dest.size >= source.size && !cloning;
 
   const destWarning = dest && source && dest.size < source.size
@@ -235,6 +236,15 @@ export default function CloneDisk({ onCloningChange }) {
     try { await invoke("cancel_clone"); } catch (_) {}
   };
 
+  const handleClearSelection = () => {
+    setSource(null);
+    setDest(null);
+    setProgress(null);
+    setCloneError(null);
+    setDone(false);
+    setStatusMsg(null);
+  };
+
   const percent = progress ? Math.round((progress.copied / progress.total) * 100) : 0;
 
   return (
@@ -246,16 +256,30 @@ export default function CloneDisk({ onCloningChange }) {
           <h2 className="text-base font-semibold text-gray-100">Clonar Disco</h2>
           <p className="text-xs text-gray-500 mt-0.5">Copia sector a sector — boot, particiones y todo el contenido</p>
         </div>
-        <button
-          onClick={loadDisks}
-          disabled={loading || cloning}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-xs text-gray-400 transition-colors disabled:opacity-40"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`}>
-            <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-          </svg>
-          Actualizar
-        </button>
+        <div className="flex items-center gap-2">
+          {(source || dest) && (
+            <button
+              onClick={handleClearSelection}
+              disabled={cloning}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-xs text-gray-400 transition-colors disabled:opacity-40"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+              Limpiar selección
+            </button>
+          )}
+          <button
+            onClick={loadDisks}
+            disabled={loading || cloning}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-xs text-gray-400 transition-colors disabled:opacity-40"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`}>
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+            Actualizar
+          </button>
+        </div>
       </div>
 
       {/* ── Error de carga ──────────────────────────────────────────────────── */}

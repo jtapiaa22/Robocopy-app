@@ -117,6 +117,38 @@ function getFileDescription(ext) {
   return ext ? `Archivo ${ext.toUpperCase()}` : "Archivo";
 }
 
+// Detecta líneas de robocopy que representan un archivo procesado (EN y ES)
+const FILE_LINE_RE = /New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i;
+
+// ─── Spinner y barra de progreso estilo terminal (para la vista CMD) ────────
+
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// Octavos de bloque para resolución sub-carácter: ▏▎▍▌▋▊▉
+const FRACTION_BLOCKS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+function asciiBar(percent, width = 24) {
+  const cells = (Math.max(0, Math.min(100, percent || 0)) / 100) * width;
+  let full = Math.floor(cells);
+  let frac = Math.round((cells - full) * 8);
+  if (frac === 8) { full += 1; frac = 0; }
+  let bar = "█".repeat(Math.min(full, width));
+  if (frac > 0 && full < width) bar += FRACTION_BLOCKS[frac];
+  return bar.padEnd(width, "░");
+}
+
+function TextSpinner({ className = "" }) {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFrame(f => (f + 1) % SPINNER_FRAMES.length), 80);
+    return () => clearInterval(id);
+  }, []);
+  return <span className={`font-mono ${className}`}>{SPINNER_FRAMES[frame]}</span>;
+}
+
+// Tope de líneas retenidas del log para no agotar memoria en copias enormes
+const MAX_LOG_LINES = 2000;
+
 // ─── Opciones de robocopy (checkboxes) ───────────────────────────────────────
 
 const ROBOCOPY_OPTIONS = [
@@ -295,6 +327,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     setExcludeFiles(cfg.excludeFiles ?? []);
     setExcludeDirs(cfg.excludeDirs ?? []);
     setFileFilter(cfg.fileFilter ?? []);
+    setMaxAge(cfg.maxAge ?? "");
     setOutputLines([]);
     setExitCode(null);
     setSummary(null);
@@ -394,60 +427,84 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
     const flags = buildFlags();
 
-    // ── Modo multi-carpeta ──────────────────────────────────────────────────
-    if (sourceFolders.length > 0) {
-      const ul1 = await listen("robocopy-output", event => {
-        const line = event.payload;
-        const wasCr = lastWasCrRef.current;
-        lastWasCrRef.current = false;
-        setOutputLines(prev => {
-          if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
-          return [...prev, line];
-        });
-        parseSummaryLine(line);
-        // Capturar líneas de error (con soporte para path en línea siguiente)
-        trackErrorLine(line, pendingErrRef, setErrorFiles);
-        // Detectar directorio actual
-        const dirInfo = parseDirLine(line);
-        if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
-        if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
-          setFileCount(p => p + 1);
-          setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
-          const parsed = parseFileLine(line);
-          if (parsed?.name) {
-            const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
-            const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
-            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
+    // Agrega una línea al log (reemplazando la anterior si venía de un \r)
+    // y descarta las más viejas al superar el tope.
+    const appendOutput = (line, wasCr) => {
+      setOutputLines(prev => {
+        const next = wasCr && prev.length > 0 ? [...prev.slice(0, -1), line] : [...prev, line];
+        return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next;
+      });
+    };
+
+    const handleOutput = (line) => {
+      const wasCr = lastWasCrRef.current;
+      lastWasCrRef.current = false;
+      appendOutput(line, wasCr);
+      parseSummaryLine(line);
+      // Capturar líneas de error (con soporte para path en línea siguiente)
+      trackErrorLine(line, pendingErrRef, setErrorFiles);
+      // Detectar directorio actual
+      const dirInfo = parseDirLine(line);
+      if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
+      if (FILE_LINE_RE.test(line)) {
+        setFileCount(p => p + 1);
+        setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
+        const parsed = parseFileLine(line);
+        if (parsed?.name) {
+          const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
+          const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
+          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
+          setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
+        }
+      }
+    };
+
+    const handleCrOutput = (line) => {
+      const wasCr = lastWasCrRef.current;
+      lastWasCrRef.current = true;
+      appendOutput(line, wasCr);
+      const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
+      if (pctMatch) {
+        const pct = parseFloat(pctMatch[1]);
+        setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
+      } else {
+        const parsed = parseFileLine(line);
+        if (parsed?.name) {
+          if (FILE_LINE_RE.test(line)) {
+            setFileCount(p => p + 1);
+            setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
             setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
           }
+          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
         }
-      });
+      }
+    };
 
-      const ulCr = await listen("robocopy-output-cr", event => {
-        const line = event.payload;
-        const wasCr = lastWasCrRef.current;
-        lastWasCrRef.current = true;
-        setOutputLines(prev => {
-          if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
-          return [...prev, line];
-        });
-        const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
-        if (pctMatch) {
-          const pct = parseFloat(pctMatch[1]);
-          setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
-        } else {
-          const parsed = parseFileLine(line);
-          if (parsed?.name) {
-            if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
-              setFileCount(p => p + 1);
-              setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
-              setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
-            }
-            setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
-          }
-        }
-      });
+    const finishRun = async (code) => {
+      setExitCode(code);
+      setRunning(false);
+      setLiveFile(null);
+      setCurrentDirInfo(null);
+      setCancelling(false);
+      if (code >= 8) setShowErrors(true);
+      unlistenRef.current.forEach(fn => fn());
+      unlistenRef.current = [];
+      await sendDoneNotification(code);
+    };
 
+    const handleInvokeError = (e) => {
+      setOutputLines(prev => [...prev, `ERROR: ${e}`]);
+      setRunning(false);
+      unlistenRef.current.forEach(fn => fn());
+      unlistenRef.current = [];
+    };
+
+    const ul1  = await listen("robocopy-output", event => handleOutput(event.payload));
+    const ulCr = await listen("robocopy-output-cr", event => handleCrOutput(event.payload));
+    unlistenRef.current = [ul1, ulCr];
+
+    // ── Modo multi-carpeta ──────────────────────────────────────────────────
+    if (sourceFolders.length > 0) {
       const ul2 = await listen("robocopy-folder-start", event => {
         const name = event.payload;
         lastWasCrRef.current = false;
@@ -466,19 +523,10 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
       const ul4 = await listen("robocopy-all-done", async event => {
         const codes = event.payload;
-        const worst = Math.max(...codes);
-        setExitCode(worst);
-        setRunning(false);
-        setLiveFile(null);
-        setCurrentDirInfo(null);
-        setCancelling(false);
-        if (worst >= 8) setShowErrors(true);
-        unlistenRef.current.forEach(fn => fn());
-        unlistenRef.current = [];
-        await sendDoneNotification(worst);
+        await finishRun(codes.length > 0 ? Math.max(...codes) : -1);
       });
 
-      unlistenRef.current = [ul1, ulCr, ul2, ul3, ul4];
+      unlistenRef.current.push(ul2, ul3, ul4);
 
       try {
         await invoke("run_robocopy_multi", {
@@ -488,84 +536,36 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           flags,
         });
       } catch (e) {
-        setOutputLines(prev => [...prev, `ERROR: ${e}`]);
-        setRunning(false);
+        handleInvokeError(e);
       }
       return;
     }
 
-    // ── Modo carpeta única (comportamiento original) ─────────────────────────
-    const ul1 = await listen("robocopy-output", event => {
-      const line = event.payload;
-      const wasCr = lastWasCrRef.current;
-      lastWasCrRef.current = false;
-      setOutputLines(prev => {
-        if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
-        return [...prev, line];
-      });
-      parseSummaryLine(line);
-      trackErrorLine(line, pendingErrRef, setErrorFiles);
-      const dirInfo = parseDirLine(line);
-      if (dirInfo) { currentDirRef.current = dirInfo.path; setCurrentDirInfo({ ...dirInfo, processed: 0 }); }
-      if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
-        setFileCount(p => p + 1);
-        setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
-        const parsed = parseFileLine(line);
-        if (parsed?.name) {
-          const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
-          const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
-          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
-          setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
-        }
-      }
-    });
-
-    const ulCr = await listen("robocopy-output-cr", event => {
-      const line = event.payload;
-      const wasCr = lastWasCrRef.current;
-      lastWasCrRef.current = true;
-      setOutputLines(prev => {
-        if (wasCr && prev.length > 0) return [...prev.slice(0, -1), line];
-        return [...prev, line];
-      });
-      const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
-      if (pctMatch) {
-        const pct = parseFloat(pctMatch[1]);
-        setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
-      } else {
-        const parsed = parseFileLine(line);
-        if (parsed?.name) {
-          if (/New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i.test(line)) {
-            setFileCount(p => p + 1);
-            setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
-            setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
-          }
-          setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
-        }
-      }
-    });
-
-    const ul2 = await listen("robocopy-done", async event => {
-      const code = event.payload;
-      setExitCode(code);
-      setRunning(false);
-      setLiveFile(null);
-      setCurrentDirInfo(null);
-      setCancelling(false);
-      if (code >= 8) setShowErrors(true);
-      unlistenRef.current.forEach(fn => fn());
-      unlistenRef.current = [];
-      await sendDoneNotification(code);
-    });
-
-    unlistenRef.current = [ul1, ulCr, ul2];
+    // ── Modo carpeta única ───────────────────────────────────────────────────
+    const ul2 = await listen("robocopy-done", event => finishRun(event.payload));
+    unlistenRef.current.push(ul2);
 
     try {
       await invoke("run_robocopy", { source, destination: dest, flags });
     } catch (e) {
-      setOutputLines(prev => [...prev, `ERROR: ${e}`]);
-      setRunning(false);
+      handleInvokeError(e);
     }
+  }
+
+  // Limpia todo lo que quedó en pantalla de la corrida anterior
+  function clearResults() {
+    setOutputLines([]);
+    setExitCode(null);
+    setSummary(null);
+    setRecentFiles([]);
+    setLiveFile(null);
+    setErrorFiles([]);
+    setShowErrors(false);
+    setFileCount(0);
+    setMultiFolderIdx(0);
+    setMultiFolderCodes([]);
+    setCurrentDirInfo(null);
+    setShowRawLog(false);
   }
 
   async function handleSaveJob() {
@@ -577,7 +577,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         name: saveName.trim(),
         source,
         destination: dest,
-        config: { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter },
+        config: { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter, maxAge },
         created_at: Math.floor(Date.now() / 1000),
       },
     });
@@ -641,6 +641,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             ))}
             {mtEnabled && <span className="px-1.5 py-0.5 bg-gray-800 rounded text-xs text-gray-400 font-mono">/MT:{mtThreads}</span>}
             <span className="px-1.5 py-0.5 bg-gray-800 rounded text-xs text-gray-400 font-mono">/R:{retries} /W:{waitTime}</span>
+            {maxAge && <span className="px-1.5 py-0.5 bg-gray-800 rounded text-xs text-gray-400 font-mono">/MAXAGE:{maxAge}</span>}
             {excludeFiles.length > 0 && <span className="text-xs text-gray-600">/XF ({excludeFiles.length})</span>}
             {excludeDirs.length  > 0 && <span className="text-xs text-gray-600">/XD ({excludeDirs.length})</span>}
             {fileFilter.length   > 0 && <span className="text-xs text-gray-600">/IF ({fileFilter.length})</span>}
@@ -838,8 +839,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
               💾 Guardar trabajo
             </button>
           )}
-          <button onClick={() => { setOutputLines([]); setExitCode(null); setSummary(null); }}
-            disabled={running || outputLines.length === 0}
+          <button onClick={clearResults}
+            disabled={running || (outputLines.length === 0 && recentFiles.length === 0 && errorFiles.length === 0 && exitCode === null)}
             className="text-xs text-gray-600 hover:text-gray-400 disabled:opacity-30 transition-colors px-2">
             Limpiar
           </button>
@@ -1001,11 +1002,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
               );
             })}
             {running && (
-              <div className="flex items-center gap-2 mt-1 text-blue-400 animate-pulse">
-                <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83" />
-                </svg>
-                {isDryRun ? "Simulando (no se están copiando archivos)..." : "Robocopy en ejecución..."}
+              <div className="flex items-center gap-2 mt-1 text-blue-400 whitespace-pre">
+                <TextSpinner className="text-cyan-400" />
+                <span>{isDryRun ? "Simulando (no se están copiando archivos)..." : "Robocopy en ejecución..."}</span>
+                {liveFile?.percent > 0 && (
+                  <span className="text-cyan-400">
+                    [{asciiBar(liveFile.percent)}] {Math.round(liveFile.percent)}%
+                  </span>
+                )}
               </div>
             )}
           </div>

@@ -20,8 +20,10 @@ function buildCommand(job) {
   // Numéricos
   const r = parseInt(cfg.retries, 10);
   const w = parseInt(cfg.waitTime, 10);
+  const a = parseInt(cfg.maxAge, 10);
   if (!isNaN(r) && r >= 0) flags.push(`/R:${r}`);
   if (!isNaN(w) && w >= 0) flags.push(`/W:${w}`);
+  if (!isNaN(a) && a >= 0) flags.push(`/MAXAGE:${a}`);
 
   // MT
   if (cfg.mtEnabled) flags.push(`/MT:${cfg.mtThreads || 8}`);
@@ -40,6 +42,7 @@ export default function JobHistory({ onLoadJob, jobsVersion }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [copiedId, setCopiedId] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   useEffect(() => {
     loadJobs();
@@ -59,6 +62,13 @@ export default function JobHistory({ onLoadJob, jobsVersion }) {
   async function deleteJob(id) {
     await invoke("delete_job", { id });
     setJobs(prev => prev.filter(j => j.id !== id));
+    setConfirmDeleteId(null);
+  }
+
+  // Primer clic pide confirmación; si no se confirma en 3 s, vuelve al estado normal
+  function askDelete(id) {
+    setConfirmDeleteId(id);
+    setTimeout(() => setConfirmDeleteId(prev => (prev === id ? null : prev)), 3000);
   }
 
   function copyCommand(job) {
@@ -135,10 +145,17 @@ export default function JobHistory({ onLoadJob, jobsVersion }) {
                         ${copiedId === job.id ? "bg-emerald-800 text-emerald-300" : "bg-gray-800 hover:bg-gray-700 text-gray-400"}`}>
                       {copiedId === job.id ? "✓ Copiado" : "Copiar CMD"}
                     </button>
-                    <button onClick={() => deleteJob(job.id)}
-                      className="px-3 py-1.5 bg-gray-800 hover:bg-red-900 rounded-lg text-xs text-gray-600 hover:text-red-400 transition-colors">
-                      Eliminar
-                    </button>
+                    {confirmDeleteId === job.id ? (
+                      <button onClick={() => deleteJob(job.id)}
+                        className="px-3 py-1.5 bg-red-800 hover:bg-red-700 rounded-lg text-xs font-medium text-red-200 transition-colors">
+                        ¿Seguro?
+                      </button>
+                    ) : (
+                      <button onClick={() => askDelete(job.id)}
+                        className="px-3 py-1.5 bg-gray-800 hover:bg-red-900 rounded-lg text-xs text-gray-600 hover:text-red-400 transition-colors">
+                        Eliminar
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -188,7 +205,9 @@ function OptionBadges({ cfg }) {
   if (opts["/Z"])   badges.push({ label: "Reiniciable",    color: "bg-gray-800 text-gray-400" });
   if (opts["/B"])   badges.push({ label: "Backup",         color: "bg-gray-800 text-gray-400" });
   if (opts["/XO"])  badges.push({ label: "Excluir antiguos", color: "bg-gray-800 text-gray-400" });
+  if (opts["/MOV"]) badges.push({ label: "Mover",          color: "bg-yellow-900 text-yellow-300" });
   if (cfg.mtEnabled) badges.push({ label: `MT:${cfg.mtThreads}`, color: "bg-emerald-900 text-emerald-300" });
+  if (cfg.maxAge)   badges.push({ label: `MAXAGE: ${cfg.maxAge}`, color: "bg-gray-800 text-gray-500" });
   if (cfg.excludeFiles?.length) badges.push({ label: `XF: ${cfg.excludeFiles.join(", ")}`, color: "bg-gray-800 text-gray-500" });
   if (cfg.excludeDirs?.length)  badges.push({ label: `XD: ${cfg.excludeDirs.join(", ")}`, color: "bg-gray-800 text-gray-500" });
   if (cfg.fileFilter?.length)   badges.push({ label: `IF: ${cfg.fileFilter.join(", ")}`, color: "bg-gray-800 text-gray-500" });
