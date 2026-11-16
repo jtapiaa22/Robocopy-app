@@ -301,6 +301,21 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [nudgeFeedback, setNudgeFeedback] = useState(false); // feedback visual tras "desbloquear"
   const [errorFiles, setErrorFiles]       = useState([]);
   const [showErrors, setShowErrors]       = useState(false);
+  const [includeParent, setIncludeParent] = useState(true); // crea la carpeta origen dentro del destino
+
+  // Nombre de la carpeta origen (null si es raíz de unidad, p. ej. "E:\")
+  const sourceFolderName = (() => {
+    const clean = (source || "").trim().replace(/[\\/]+$/, "");
+    if (!clean || /^[a-zA-Z]:$/.test(clean)) return null;
+    const name = clean.split(/[\\/]/).pop();
+    return name || null;
+  })();
+  // Solo aplica en modo carpeta única (desde el Explorador ya se copia la carpeta en sí)
+  const canIncludeParent = !!sourceFolderName && sourceFolders.length === 0 && sourceFiles.length === 0;
+  const applyParent      = canIncludeParent && includeParent;
+  const effectiveDest    = applyParent && dest
+    ? `${dest.replace(/[\\/]+$/, "")}\\${sourceFolderName}`
+    : dest;
 
   const outputRef      = useRef(null);
   const unlistenRef    = useRef([]);
@@ -328,6 +343,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     setExcludeDirs(cfg.excludeDirs ?? []);
     setFileFilter(cfg.fileFilter ?? []);
     setMaxAge(cfg.maxAge ?? "");
+    setIncludeParent(cfg.includeParent ?? false); // trabajos viejos: copiaban solo el contenido
     setOutputLines([]);
     setExitCode(null);
     setSummary(null);
@@ -546,7 +562,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     unlistenRef.current.push(ul2);
 
     try {
-      await invoke("run_robocopy", { source, destination: dest, flags });
+      await invoke("run_robocopy", { source, destination: effectiveDest, flags });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -577,7 +593,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         name: saveName.trim(),
         source,
         destination: dest,
-        config: { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter, maxAge },
+        config: { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter, maxAge, includeParent },
         created_at: Math.floor(Date.now() / 1000),
       },
     });
@@ -601,6 +617,22 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           <PathField label="Carpeta Destino" value={dest}   onChange={onDestChange}
             color="purple"  placeholder="D:\ruta\de\destino" onBrowse={onGoToExplorer} />
         </div>
+
+        {/* Copiar la carpeta en sí o solo su contenido */}
+        {canIncludeParent && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 bg-gray-800/50 border border-gray-700/60 rounded-lg">
+            <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer select-none">
+              <input type="checkbox" checked={includeParent} onChange={e => setIncludeParent(e.target.checked)}
+                className="accent-emerald-500" />
+              Crear carpeta <span className="font-mono text-emerald-400">"{sourceFolderName}"</span> en destino
+            </label>
+            <span className="text-xs text-gray-500 truncate min-w-0 flex-1" title={effectiveDest || ""}>
+              {dest
+                ? <>Se copiará en: <span className="font-mono text-purple-400">{effectiveDest}</span></>
+                : includeParent ? "Se copia la carpeta completa" : "Se copia solo su contenido"}
+            </span>
+          </div>
+        )}
 
         {/* Badge de carpetas seleccionadas para copia múltiple */}
         {sourceFolders.length > 0 && (
@@ -910,7 +942,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           liveFile={liveFile}
           recentFiles={recentFiles}
           source={source}
-          dest={dest}
+          dest={effectiveDest}
           isDryRun={isDryRun}
           currentDirInfo={running ? currentDirInfo : null}
         />
