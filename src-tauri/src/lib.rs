@@ -285,6 +285,55 @@ async fn run_robocopy(
     Ok(code)
 }
 
+// Corre robocopy en silencio y devuelve toda su salida (para el pre-escaneo con /L,
+// que calcula cuántos archivos y bytes se van a copiar sin tocar nada).
+// Registra el PID para que "Cancelar" también lo corte.
+#[tauri::command]
+async fn scan_robocopy(
+    app: tauri::AppHandle,
+    source: String,
+    destination: String,
+    flags: Vec<String>,
+) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = Command::new("robocopy");
+    cmd.arg(&source)
+        .arg(&destination)
+        .args(&flags)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let state = app.state::<ProcessState>();
+    *state.pid.lock().unwrap() = child.id();
+
+    let mut out = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_end(&mut out).await;
+    }
+    let _ = child.wait().await;
+    *state.pid.lock().unwrap() = None;
+
+    if state.cancelled.load(Ordering::SeqCst) {
+        return Err("cancelado".into());
+    }
+    Ok(decode_cmd_output(&out))
+}
+
+// Marca el inicio de una nueva operación (limpia una cancelación anterior)
+#[tauri::command]
+fn reset_cancel(app: tauri::AppHandle) {
+    app.state::<ProcessState>().cancelled.store(false, Ordering::SeqCst);
+}
+
 // ─── Comandos: historial de trabajos ────────────────────────────────────────
 
 #[tauri::command]
@@ -982,6 +1031,8 @@ pub fn run() {
             get_parent_path,
             run_robocopy,
             run_robocopy_multi,
+            scan_robocopy,
+            reset_cancel,
             nudge_robocopy,
             cancel_robocopy,
             save_job,

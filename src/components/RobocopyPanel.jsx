@@ -69,6 +69,38 @@ function isErrorLine(line) {
   return /\bERROR\s+\d+\s+\(0x[0-9a-f]+\)/i.test(line) || /^\s*(?:[\d/]+\s+[\d:]+\s+)?ERROR\s*:/i.test(line);
 }
 
+// ─── Pre-escaneo (progreso total) ────────────────────────────────────────────
+
+// Mismas opciones que la copia real, pero como simulación silenciosa:
+// /L no copia nada, /NFL /NDL /NJH dejan solo el resumen, /BYTES da tamaños exactos.
+function buildScanFlags(flags) {
+  const base = flags.filter(f => !/^\/(L|R:\d+|W:\d+)$/i.test(f));
+  return [...base, "/L", "/NFL", "/NDL", "/NJH", "/BYTES", "/R:0", "/W:0"];
+}
+
+// Del resumen de la simulación saca la columna "Copiado" de archivos y bytes
+function parseScanTotals(text) {
+  const fiveCols = String.raw`\s*:\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)`;
+  let files = null, bytes = null;
+  for (const line of text.split(/\r?\n/)) {
+    const f = line.match(new RegExp(String.raw`^\s*${FILES_LABEL}${fiveCols}`, "i"));
+    const b = line.match(/^\s*Bytes\s*:\s+(\S+(?:\s+[kmgt]\b)?)\s+(\S+(?:\s+[kmgt]\b)?)/i);
+    if (f) files = toInt(f[2]);
+    if (b) bytes = parseByteSize(b[2]);
+  }
+  return files === null || bytes === null ? null : { files, bytes };
+}
+
+// Líneas de archivo que implican una copia real (las EXTRA solo se listan)
+const COPY_LINE_RE = /New File|Nuevo arch|\bNewer\b|Más rec|\bOlder\b|Más ant|\bChanged\b|Modificado|Cambiado/i;
+
+function formatDuration(secs) {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60)   return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
+  return `${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")} min`;
+}
+
 // ─── Rutas de Windows ────────────────────────────────────────────────────────
 
 function normWinPath(p) {
@@ -142,12 +174,16 @@ function parseFileLine(line) {
   // Formato: "\tNew File \t\t  1.23 m\tfilename.pdf" — el nombre es el último segmento por tab
   const segs = line.split("\t").map(s => s.trim()).filter(Boolean);
   if (segs.length < 2) return null;
-  const name = segs[segs.length - 1];
+  // Con /MT robocopy pone la ruta completa: nos quedamos con el nombre
+  const name = segs[segs.length - 1].split(/[\\/]/).pop();
   if (!name || !name.includes(".")) return null;
   if (/^(New File|Newer|Older|EXTRA|ERROR|FAILED|Nuevo archivo|Más reciente|Más antiguo|\*?Archivo EXTRA)$/i.test(name)) return null;
   const ext = name.split(".").pop().toLowerCase();
-  const sizeMatch = line.match(/\b(\d[\d,.]*\s*[kKmMgG]?)\s+\S+\s*$/);
-  return { name, ext, size: sizeMatch?.[1]?.trim() || "" };
+  // El tamaño es el segmento anterior al nombre ("1.7 m", "2997"). Funciona aunque el nombre tenga espacios.
+  const sizeSeg = segs.length >= 3 ? segs[segs.length - 2] : "";
+  const size = /^[\d.,]+(?:\s*[kmgt])?$/i.test(sizeSeg) ? sizeSeg : "";
+  // label = la etiqueta de robocopy ("Nuevo archivo", "*Archivo EXTRA"…), sin el nombre ni la ruta
+  return { name, ext, size, sizeBytes: size ? parseByteSize(size) : 0, label: segs.length >= 3 ? segs[0] : "" };
 }
 
 function parseDirLine(line) {
@@ -365,6 +401,13 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [errorFiles, setErrorFiles]       = useState([]);
   const [showErrors, setShowErrors]       = useState(false);
   const [includeParent, setIncludeParent] = useState(true); // crea la carpeta origen dentro del destino
+  // Progreso total: totals = lo que se va a copiar (pre-escaneo), overall = lo copiado hasta ahora
+  const [scanning, setScanning] = useState(false);
+  const [totals, setTotals]     = useState(null); // { files, bytes }
+  const [overall, setOverall]   = useState(null); // { files, bytes }
+  const [, setTick]             = useState(0);    // refresca el tiempo restante cada segundo
+  const progRef      = useRef({ doneBytes: 0, doneFiles: 0, curSize: 0, curPct: 0, active: false, start: 0 });
+  const cancelReqRef = useRef(false);
 
   // Nombre de la carpeta origen (null si es raíz de unidad, p. ej. "E:\")
   const sourceFolderName = (() => {
@@ -439,6 +482,43 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     const ft = liveFile ? getFileType(liveFile.ext) : null;
     onStatusChange?.({ running, liveFile, ft, fileCount });
   }, [running, liveFile, fileCount]);
+
+  // Mientras copia, re-renderiza cada segundo para que velocidad/tiempo restante no se congelen
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  // ── Contabilidad del progreso total ──
+  function pushOverall() {
+    const p = progRef.current;
+    setOverall({
+      bytes: p.doneBytes + (p.active ? p.curSize * p.curPct / 100 : 0),
+      files: p.doneFiles + (p.active ? 1 : 0),
+    });
+  }
+  // Empieza un archivo nuevo: el anterior se da por terminado
+  function progFileStart(line, parsed) {
+    // Se mira solo la etiqueta: un archivo llamado "extras.zip" sí se copia
+    const label = parsed?.label || "";
+    if (!COPY_LINE_RE.test(label) || /EXTRA/i.test(label)) return;
+    const p = progRef.current;
+    if (p.active) { p.doneBytes += p.curSize; p.doneFiles += 1; }
+    p.active = true; p.curSize = parsed?.sizeBytes || 0; p.curPct = 0;
+    pushOverall();
+  }
+  function progPercent(pct) {
+    const p = progRef.current;
+    if (!p.active) return;
+    p.curPct = pct;
+    pushOverall();
+  }
+  function progFlush() {
+    const p = progRef.current;
+    if (p.active) { p.doneBytes += p.curSize; p.doneFiles += 1; p.active = false; }
+    pushOverall();
+  }
 
   // Limpia listeners al desmontar
   useEffect(() => () => unlistenRef.current.forEach(fn => fn()), []);
@@ -541,6 +621,49 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     currentDirRef.current = "";
 
     const flags = buildFlags();
+    const multi = sourceFolders.length > 0;
+
+    // ── Pre-escaneo: cuánto hay que copiar (para progreso total y tiempo restante) ──
+    cancelReqRef.current = false;
+    progRef.current = { doneBytes: 0, doneFiles: 0, curSize: 0, curPct: 0, active: false, start: 0 };
+    setTotals(null);
+    setOverall(null);
+    await invoke("reset_cancel").catch(() => {});
+
+    if (!isDryRun) {
+      setScanning(true);
+      const pairs = multi
+        ? sourceFolders.map(f => [joinWinPath(source, f), joinWinPath(dest, f)])
+        : [[source, effectiveDest]];
+      let sum = { files: 0, bytes: 0 };
+      let scanErr = null;
+      try {
+        for (const [s, d] of pairs) {
+          if (cancelReqRef.current) break;
+          const out = await invoke("scan_robocopy", { source: s, destination: d, flags: buildScanFlags(flags) });
+          const t = parseScanTotals(out);
+          if (!t) { sum = null; scanErr = "no se encontró el resumen en la salida"; break; }
+          sum.files += t.files;
+          sum.bytes += t.bytes;
+        }
+      } catch (e) {
+        sum = null;
+        scanErr = String(e);
+      }
+      // Si falla, la copia sigue igual, solo que sin progreso total
+      if (scanErr && !cancelReqRef.current) {
+        setOutputLines([`(No se pudo calcular el total, se copia sin barra de progreso total: ${scanErr})`]);
+      }
+      setScanning(false);
+      if (cancelReqRef.current) {
+        setRunning(false);
+        setCancelling(false);
+        setOutputLines(["Cancelado mientras se calculaba el tamaño total. No se copió nada."]);
+        return;
+      }
+      if (sum) setTotals(sum);
+    }
+    progRef.current.start = Date.now();
 
     // Agrega una línea al log (reemplazando la anterior si venía de un \r)
     // y descarta las más viejas al superar el tope.
@@ -568,6 +691,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         if (parsed?.name) {
           const pctOnLine = line.trim().match(/^(\d+(?:\.\d+)?)%/);
           const pct = pctOnLine ? parseFloat(pctOnLine[1]) : 0;
+          progFileStart(line, parsed);
+          if (pct) progPercent(pct);
           setLiveFile({ ...parsed, dir: currentDirRef.current, percent: pct });
           setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
         }
@@ -581,6 +706,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       const pctMatch = line.trim().match(/^(\d+(?:\.\d+)?)%/);
       if (pctMatch) {
         const pct = parseFloat(pctMatch[1]);
+        progPercent(pct);
         setLiveFile(prev => prev ? { ...prev, percent: pct } : { name: "", ext: "", size: "", dir: currentDirRef.current, percent: pct });
       } else {
         const parsed = parseFileLine(line);
@@ -589,6 +715,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             setFileCount(p => p + 1);
             setCurrentDirInfo(prev => prev ? { ...prev, processed: prev.processed + 1 } : prev);
             setRecentFiles(prev => [{ ...parsed, dir: currentDirRef.current }, ...prev].slice(0, 10));
+            progFileStart(line, parsed);
           }
           setLiveFile({ ...parsed, dir: currentDirRef.current, percent: 0 });
         }
@@ -596,6 +723,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     };
 
     const finishRun = async (code) => {
+      progFlush();
       setExitCode(code);
       setRunning(false);
       setLiveFile(null);
@@ -633,6 +761,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       });
 
       const ul3 = await listen("robocopy-folder-done", event => {
+        progFlush();
         setMultiFolderCodes(prev => [...prev, event.payload]);
       });
 
@@ -672,6 +801,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     setOutputLines([]);
     setExitCode(null);
     setSummary(null);
+    setTotals(null);
+    setOverall(null);
     setRecentFiles([]);
     setLiveFile(null);
     setErrorFiles([]);
@@ -702,6 +833,19 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   }
 
   const canRun  = !!(source && dest && !running && !pathError);
+
+  // Progreso total (solo si el pre-escaneo dio resultado)
+  const progress = (() => {
+    if (!running || scanning || !totals || (totals.bytes <= 0 && totals.files <= 0)) return null;
+    const done = overall ?? { bytes: 0, files: 0 };
+    const frac = totals.bytes > 0 ? done.bytes / totals.bytes : done.files / totals.files;
+    const pct  = Math.max(0, Math.min(100, frac * 100));
+    const elapsed = progRef.current.start ? (Date.now() - progRef.current.start) / 1000 : 0;
+    const speed   = elapsed >= 2 && done.bytes > 0 ? done.bytes / elapsed : null;
+    // Tiempo restante: se muestra recién a los 3 s para que la estimación no salte
+    const eta = speed && elapsed >= 3 && totals.bytes > 0 ? Math.max(0, totals.bytes - done.bytes) / speed : null;
+    return { pct, speed, eta };
+  })();
   const result  = exitCode !== null ? interpretExitCode(exitCode) : null;
   const isDryRun = options["/L"];
 
@@ -893,7 +1037,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
               </div>
             ) : (
               <button
-                onClick={() => { setCancelling(true); invoke("cancel_robocopy").catch(() => setCancelling(false)); }}
+                onClick={() => { cancelReqRef.current = true; setCancelling(true); invoke("cancel_robocopy").catch(() => setCancelling(false)); }}
                 className="flex items-center gap-2 px-5 py-2 bg-red-800 hover:bg-red-700 active:bg-red-900 rounded-lg text-sm font-semibold text-red-200 transition-colors"
               >
                 <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
@@ -987,9 +1131,11 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       {/* ── Barra de progreso ────────────────────────────────────────────────── */}
       {(running || exitCode !== null) && (
         <div className="px-4 py-2.5 bg-gray-900/80 border-b border-gray-800 shrink-0">
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="text-xs text-gray-400">
-              {running
+          <div className="flex items-center justify-between gap-3 mb-1.5">
+            <span className="text-xs text-gray-400 truncate">
+              {scanning
+                ? "Calculando cuánto hay que copiar…"
+                : running
                 ? sourceFolders.length > 0
                   ? `Carpeta ${multiFolderIdx} de ${sourceFolders.length}: "${sourceFolders[multiFolderIdx - 1] ?? ""}" — ${fileCount} archivos`
                   : `${isDryRun ? "Simulando" : "Copiando"}... ${fileCount > 0 ? `${fileCount} archivo${fileCount !== 1 ? "s" : ""} procesado${fileCount !== 1 ? "s" : ""}` : "iniciando"}`
@@ -997,6 +1143,15 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                   ? `${sourceFolders.length} carpetas — ${multiFolderCodes.filter(c => c >= 8).length === 0 ? "completado" : "con errores"}`
                   : result?.desc}
             </span>
+            {progress && (
+              <span className="text-xs text-gray-400 font-mono tabular-nums shrink-0">
+                <span className="text-blue-300 font-semibold">{progress.pct.toFixed(0)}%</span>
+                {totals.bytes > 0 && <> · {formatBytes(Math.min(overall?.bytes ?? 0, totals.bytes))} de {formatBytes(totals.bytes)}</>}
+                {" "}· {Math.min(overall?.files ?? 0, totals.files)}/{totals.files} arch.
+                {progress.speed && <> · {formatSpeed(progress.speed)}</>}
+                {progress.eta != null && <> · <span className="text-gray-200">faltan {formatDuration(progress.eta)}</span></>}
+              </span>
+            )}
             {!running && exitCode !== null && (
               <span className={`text-xs font-medium ${result?.color}`}>
                 {exitCode >= 8 ? "✗" : "✓"} código {exitCode}
@@ -1005,7 +1160,15 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           </div>
           <div className="relative h-1.5 bg-gray-800 rounded-full overflow-hidden">
             {running ? (
-              sourceFolders.length > 0 ? (
+              progress ? (
+                // Progreso total real (bytes copiados / bytes a copiar)
+                <div
+                  className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                  style={{ width: `${progress.pct}%` }}
+                />
+              ) : scanning ? (
+                <div className="absolute inset-y-0 left-0 w-1/4 bg-gradient-to-r from-transparent via-gray-400 to-transparent motion-safe:animate-shimmer" />
+              ) : sourceFolders.length > 0 ? (
                 // Progreso escalonado por carpeta
                 <div
                   className="h-full bg-emerald-500 rounded-full transition-all duration-500"
