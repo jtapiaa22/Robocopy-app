@@ -16,6 +16,69 @@ function interpretExitCode(code) {
   return            { label: "Con errores",             color: "text-red-400",     desc: `Código ${code}: algunos archivos no se copiaron.` };
 }
 
+// ─── Etiquetas del resumen de robocopy (Windows en inglés y en español) ─────
+// EN: "Dirs :", "Files :", "Bytes :", "Times :", "Speed :"
+// ES: "Director.:", "Archivos:", "Bytes:", "Tiempo:", "Velocidad:"
+const DIRS_LABEL  = String.raw`(?:Dirs|Director(?:\.|ios)?)`;
+const FILES_LABEL = String.raw`(?:Files|Archivos)`;
+const SUMMARY_LINE_RE = /^\s*(?:Dirs|Director(?:\.|ios)?|Files|Archivos|Bytes|Times|Tiempos?|Speed|Velocidad)\s*:\s*\d/i;
+const HEADER_LINE_RE  = /^\s*(?:Started|Source|Dest|Files|Options|Ended|Iniciado|Origen|Destino|Archivos|Opciones|Finalizado)\s*:/i;
+
+// Convierte "0.401" / "0,401" / "1,234.5" / "1.234,5" a número
+function parseLocaleNumber(str) {
+  const s = str.trim();
+  const lastDot = s.lastIndexOf("."), lastComma = s.lastIndexOf(",");
+  if (lastDot >= 0 && lastComma >= 0) {
+    return lastComma > lastDot
+      ? parseFloat(s.replace(/\./g, "").replace(",", "."))
+      : parseFloat(s.replace(/,/g, ""));
+  }
+  return parseFloat(s.replace(",", "."));
+}
+
+const toInt = s => parseInt(String(s).replace(/[.,]/g, ""), 10) || 0;
+
+// "1.479 g" / "350.2 m" / "7" → bytes (robocopy usa unidades de 1024)
+function parseByteSize(str) {
+  const m = String(str).trim().match(/^([\d.,]+)\s*([kmgt])?$/i);
+  if (!m) return 0;
+  const mult = { k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[(m[2] || "").toLowerCase()] ?? 1;
+  return (m[2] ? parseLocaleNumber(m[1]) : toInt(m[1])) * mult;
+}
+
+function formatBytes(b) {
+  if (b >= 1024 ** 4) return `${(b / 1024 ** 4).toFixed(2)} TB`;
+  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(2)} GB`;
+  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  if (b >= 1024)      return `${(b / 1024).toFixed(0)} KB`;
+  return `${Math.round(b)} B`;
+}
+
+function formatSpeed(bps) {
+  return bps > 1e9 ? `${(bps / 1e9).toFixed(2)} GB/s`
+       : bps > 1e6 ? `${(bps / 1e6).toFixed(1)} MB/s`
+       : bps > 1e3 ? `${(bps / 1e3).toFixed(0)} KB/s`
+       : `${bps.toFixed(0)} B/s`;
+}
+
+// Línea de error real de robocopy, no la cabecera de columnas ("... ERROR Extras")
+// ni rutas que contengan "error". Formatos:
+//   "2026/11/16 11:14:06 ERROR 5 (0x00000005) Copiando archivo C:\..."
+//   "ERROR : Invalid Parameter #3"  /  "ERROR: RETRY LIMIT EXCEEDED."
+function isErrorLine(line) {
+  return /\bERROR\s+\d+\s+\(0x[0-9a-f]+\)/i.test(line) || /^\s*(?:[\d/]+\s+[\d:]+\s+)?ERROR\s*:/i.test(line);
+}
+
+// ─── Rutas de Windows ────────────────────────────────────────────────────────
+
+function normWinPath(p) {
+  return (p || "").trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function joinWinPath(parent, child) {
+  return `${(parent || "").replace(/[\\/]+$/, "")}\\${child}`;
+}
+
 // ─── Clasifica líneas del output para colorearlas ───────────────────────────
 
 function classifyLine(line) {
@@ -23,13 +86,13 @@ function classifyLine(line) {
   if (!t) return "empty";
   if (t.startsWith("---")) return "separator";
   if (/^\s*\d+(?:\.\d+)?%/.test(line)) return "progress";
-  if (/New File/i.test(line)) return "new";
-  if (/\bNewer\b/i.test(line)) return "newer";
-  if (/\bOlder\b/i.test(line)) return "older";
-  if (/FAILED|ERROR/i.test(line)) return "error";
-  if (/EXTRA File|EXTRA Dir/i.test(line)) return "extra";
-  if (/^\s*(Dirs|Files|Bytes|Times|Speed)\s*:/i.test(line)) return "summary";
-  if (/^\s*(Started|Source|Dest|Options|Ended)\s*:/i.test(line)) return "header";
+  if (/New File|Nuevo arch/i.test(line)) return "new";
+  if (/\bNewer\b|Más rec/i.test(line)) return "newer";
+  if (/\bOlder\b|Más ant/i.test(line)) return "older";
+  if (isErrorLine(line)) return "error";
+  if (/EXTRA (File|Dir)|(Archivo|Directorio) EXTRA/i.test(line)) return "extra";
+  if (SUMMARY_LINE_RE.test(line)) return "summary";
+  if (HEADER_LINE_RE.test(line)) return "header";
   if (/ROBOCOPY/i.test(line)) return "title";
   return "normal";
 }
@@ -81,7 +144,7 @@ function parseFileLine(line) {
   if (segs.length < 2) return null;
   const name = segs[segs.length - 1];
   if (!name || !name.includes(".")) return null;
-  if (/^(New File|Newer|Older|EXTRA|ERROR|FAILED)$/i.test(name)) return null;
+  if (/^(New File|Newer|Older|EXTRA|ERROR|FAILED|Nuevo archivo|Más reciente|Más antiguo|\*?Archivo EXTRA)$/i.test(name)) return null;
   const ext = name.split(".").pop().toLowerCase();
   const sizeMatch = line.match(/\b(\d[\d,.]*\s*[kKmMgG]?)\s+\S+\s*$/);
   return { name, ext, size: sizeMatch?.[1]?.trim() || "" };
@@ -118,7 +181,7 @@ function getFileDescription(ext) {
 }
 
 // Detecta líneas de robocopy que representan un archivo procesado (EN y ES)
-const FILE_LINE_RE = /New File|Nuevo arch|Nuevo archivo|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|EXTRA arch/i;
+const FILE_LINE_RE = /New File|Nuevo arch|\bNewer\b|Más rec|\bOlder\b|Más ant|EXTRA File|Archivo EXTRA/i;
 
 // ─── Spinner y barra de progreso estilo terminal (para la vista CMD) ────────
 
@@ -217,7 +280,7 @@ function SummaryCard({ summary, exitCode }) {
             <Stat label="Archivos copiados" value={summary.files.copied} color="text-emerald-400" />
             <Stat label="Archivos totales"  value={summary.files.total}  color="text-gray-300" />
             <Stat label="Omitidos"          value={summary.files.skipped} color="text-gray-500" />
-            <Stat label="Fallidos"          value={summary.files.failed}  color={summary.files.failed !== "0" ? "text-red-400" : "text-gray-500"} />
+            <Stat label="Fallidos"          value={summary.files.failed}  color={summary.files.failed > 0 ? "text-red-400" : "text-gray-500"} />
           </>
         )}
         {summary.dirs && (
@@ -227,7 +290,7 @@ function SummaryCard({ summary, exitCode }) {
           </>
         )}
         {summary.bytes && (
-          <Stat label="Datos copiados" value={summary.bytes.copied} color="text-cyan-400" />
+          <Stat label="Datos copiados" value={formatBytes(summary.bytes.copied)} color="text-cyan-400" />
         )}
         {summary.speed && (
           <Stat label="Velocidad" value={summary.speed} color="text-yellow-400" />
@@ -254,7 +317,7 @@ function trackErrorLine(line, pendingErrRef, setErrorFiles) {
   const trimmed = line.trim();
   if (!trimmed) return;
 
-  if (/ERROR|FAILED/i.test(trimmed)) {
+  if (isErrorLine(trimmed)) {
     // Si el path ya está en esta línea (p.ej. "ERROR 5 ... Copying File C:\ruta\archivo")
     if (/[A-Za-z]:[\\\/]|^\\\\\S/.test(trimmed)) {
       setErrorFiles(prev => [...prev, trimmed]);
@@ -317,6 +380,23 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     ? `${dest.replace(/[\\/]+$/, "")}\\${sourceFolderName}`
     : dest;
 
+  // Evita copiar una carpeta sobre sí misma o dentro de sí misma (con subcarpetas
+  // robocopy vuelve a copiar lo que acaba de copiar y entra en bucle).
+  const pathError = (() => {
+    if (!source || !dest) return null;
+    const recursive = options["/E"] || options["/S"] || options["/MIR"];
+    const pairs = sourceFolders.length > 0
+      ? sourceFolders.map(f => [joinWinPath(source, f), joinWinPath(dest, f)])
+      : [[source, effectiveDest]];
+    for (const [src, dst] of pairs) {
+      const s = normWinPath(src), d = normWinPath(dst);
+      if (s === d) return "El origen y el destino son la misma carpeta.";
+      if (recursive && d.startsWith(s + "\\"))
+        return `El destino está dentro del origen (${dst}). Con subcarpetas activadas robocopy entraría en bucle.`;
+    }
+    return null;
+  })();
+
   const outputRef      = useRef(null);
   const unlistenRef    = useRef([]);
   const lastWasCrRef   = useRef(false);
@@ -369,22 +449,41 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
   // Parsea líneas de resumen estadístico del output de robocopy
   function parseSummaryLine(line) {
-    const dirsMatch  = line.match(/^\s*Dirs\s*:\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i);
-    const filesMatch = line.match(/^\s*Files\s*:\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i);
-    const bytesMatch = line.match(/^\s*Bytes\s*:\s+(\S+(?:\s+\S+)?)\s+(\S+(?:\s+\S+)?)/i);
-    const speedMatch = line.match(/Speed\s*:\s+([\d,.\s]+Bytes\/Sec)/i);
+    const fiveCols   = String.raw`\s*:\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)`;
+    const dirsMatch  = line.match(new RegExp(String.raw`^\s*${DIRS_LABEL}${fiveCols}`, "i"));
+    const filesMatch = line.match(new RegExp(String.raw`^\s*${FILES_LABEL}${fiveCols}`, "i"));
+    const bytesMatch = line.match(/^\s*Bytes\s*:\s+(\S+(?:\s+[kmgt]\b)?)\s+(\S+(?:\s+[kmgt]\b)?)/i);
+    // Se usa la línea en MB/min: el valor en Bytes/s cambia de separadores según el idioma
+    // ("7,000 Bytes/s" en español son 7000). MB de robocopy = 1 048 576 bytes.
+    const mbMinMatch = line.match(/(?:Speed|Velocidad)\s*:\s*([\d.,]+)\s*MegaBytes\/min/i);
 
-    if (dirsMatch)  setSummary(p => ({ ...p, dirs:  { total: dirsMatch[1],  copied: dirsMatch[2],  skipped: dirsMatch[3], failed: dirsMatch[5] } }));
-    if (filesMatch) setSummary(p => ({ ...p, files: { total: filesMatch[1], copied: filesMatch[2], skipped: filesMatch[3], failed: filesMatch[5] } }));
-    if (bytesMatch) setSummary(p => ({ ...p, bytes: { total: bytesMatch[1], copied: bytesMatch[2] } }));
-    if (speedMatch) {
-      const bps = parseFloat(speedMatch[1].replace(/[,\s]/g, "").replace("Bytes/Sec", ""));
-      if (!isNaN(bps)) {
-        const speed = bps > 1e9 ? `${(bps/1e9).toFixed(2)} GB/s`
-                    : bps > 1e6 ? `${(bps/1e6).toFixed(1)} MB/s`
-                    : bps > 1e3 ? `${(bps/1e3).toFixed(0)} KB/s`
-                    : `${bps} B/s`;
-        setSummary(p => ({ ...p, speed }));
+    // Los valores se SUMAN: en modo multi-carpeta robocopy imprime un resumen por carpeta.
+    // (summary arranca en null en cada corrida, así que en modo simple la suma es el valor tal cual)
+    const counts = m => ({ total: toInt(m[1]), copied: toInt(m[2]), skipped: toInt(m[3]), failed: toInt(m[5]) });
+    const addCounts = (a, b) => a
+      ? { total: a.total + b.total, copied: a.copied + b.copied, skipped: a.skipped + b.skipped, failed: a.failed + b.failed }
+      : b;
+
+    if (dirsMatch)  setSummary(p => ({ ...p, dirs:  addCounts(p?.dirs,  counts(dirsMatch)) }));
+    if (filesMatch) setSummary(p => ({ ...p, files: addCounts(p?.files, counts(filesMatch)) }));
+    if (bytesMatch) {
+      const total = parseByteSize(bytesMatch[1]), copied = parseByteSize(bytesMatch[2]);
+      setSummary(p => ({
+        ...p,
+        bytes: { total: (p?.bytes?.total ?? 0) + total, copied: (p?.bytes?.copied ?? 0) + copied },
+        lastCopied: copied, // para ponderar la velocidad de esta carpeta
+      }));
+    }
+    if (mbMinMatch) {
+      const bps = parseLocaleNumber(mbMinMatch[1]) * 1048576 / 60;
+      if (!isNaN(bps) && bps > 0) {
+        setSummary(p => {
+          // Velocidad global = bytes copiados totales / tiempo de copia total
+          const secs     = (p?.copySecs ?? 0) + (p?.lastCopied ?? 0) / bps;
+          const copied   = p?.bytes?.copied ?? 0;
+          const overall  = secs > 0 && copied > 0 ? copied / secs : bps;
+          return { ...p, copySecs: secs, speed: formatSpeed(overall) };
+        });
       }
     }
   }
@@ -418,7 +517,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   }
 
   async function startRobocopy() {
-    if (!source || !dest) return;
+    if (!source || !dest || pathError) return;
     setRunning(true);
     setExitCode(null);
     setSummary(null);
@@ -602,7 +701,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     onJobSaved?.();
   }
 
-  const canRun  = !!(source && dest && !running);
+  const canRun  = !!(source && dest && !running && !pathError);
   const result  = exitCode !== null ? interpretExitCode(exitCode) : null;
   const isDryRun = options["/L"];
 
@@ -631,6 +730,12 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                 ? <>Se copiará en: <span className="font-mono text-purple-400">{effectiveDest}</span></>
                 : includeParent ? "Se copia la carpeta completa" : "Se copia solo su contenido"}
             </span>
+          </div>
+        )}
+
+        {pathError && (
+          <div className="px-3 py-2 bg-red-950/40 border border-red-800/60 rounded-lg text-xs text-red-300">
+            ⚠ {pathError}
           </div>
         )}
 

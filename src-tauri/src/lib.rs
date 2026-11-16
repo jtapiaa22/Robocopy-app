@@ -327,8 +327,9 @@ async fn run_robocopy_multi(
     for folder in &folders {
         if state.cancelled.load(Ordering::SeqCst) { break; }
 
-        let src = format!("{}\\{}", parent_source, folder);
-        let dst = format!("{}\\{}", parent_dest, folder);
+        // Path::join evita dobles barras cuando el padre es raíz de unidad ("D:\")
+        let src = Path::new(&parent_source).join(folder);
+        let dst = Path::new(&parent_dest).join(folder);
 
         let _ = app.emit("robocopy-folder-start", folder.clone());
 
@@ -346,13 +347,26 @@ async fn run_robocopy_multi(
             cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
-        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        // Si una carpeta falla al iniciar, se registra como error (16) y se sigue con las demás
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app.emit("robocopy-output", format!("ERROR: no se pudo iniciar robocopy para \"{}\": {}", folder, e));
+                codes.push(16);
+                let _ = app.emit("robocopy-folder-done", 16);
+                continue;
+            }
+        };
         *state.pid.lock().unwrap() = child.id();
 
-        let stdout = child.stdout.take().ok_or("No stdout")?;
-        stream_output(app.clone(), stdout).await;
+        if let Some(stdout) = child.stdout.take() {
+            stream_output(app.clone(), stdout).await;
+        }
 
-        let code = child.wait().await.map_err(|e| e.to_string())?.code().unwrap_or(-1);
+        let code = match child.wait().await {
+            Ok(s) => s.code().unwrap_or(-1),
+            Err(_) => 16,
+        };
         *state.pid.lock().unwrap() = None;
         codes.push(code);
         let _ = app.emit("robocopy-folder-done", code);
