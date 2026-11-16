@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "robocopy-app"
-version = "0.1.0"
+version = "3.0.4"
 dependencies = [
  "serde",
  "serde_json",
