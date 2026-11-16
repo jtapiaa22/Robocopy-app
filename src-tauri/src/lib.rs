@@ -80,6 +80,18 @@ struct FileEntry {
     size: u64,
     modified: u64,
     extension: String,
+    hidden: bool, // atributo oculto o de sistema
+}
+
+// Detalle de una unidad para el Explorador (nombre, espacio, si es extraíble)
+#[derive(Serialize, Clone)]
+struct DriveDetails {
+    letter: String,
+    root: String,
+    label: String,
+    total: u64,
+    free: u64,
+    removable: bool,
 }
 
 #[derive(Serialize, Clone, PartialEq)]
@@ -145,6 +157,47 @@ fn list_drives() -> Vec<DriveInfo> {
     get_drives()
 }
 
+// Nombre, espacio total/libre y tipo de cada unidad (se pide aparte de `list_drives`
+// porque el espacio libre cambia todo el tiempo y no debe disparar "drives-changed")
+#[tauri::command]
+async fn list_drive_details() -> Vec<DriveDetails> {
+    tauri::async_runtime::spawn_blocking(|| {
+        get_drives().into_iter().map(|d| drive_details(&d)).collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn drive_details(d: &DriveInfo) -> DriveDetails {
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW};
+    const DRIVE_REMOVABLE: u32 = 2;
+
+    let root: Vec<u16> = d.root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut label_buf = [0u16; 261];
+    let (mut free, mut total) = (0u64, 0u64);
+    let (has_label, removable) = unsafe {
+        let ok = GetVolumeInformationW(
+            root.as_ptr(), label_buf.as_mut_ptr(), label_buf.len() as u32,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0,
+        ) != 0;
+        GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, std::ptr::null_mut());
+        (ok, GetDriveTypeW(root.as_ptr()) == DRIVE_REMOVABLE)
+    };
+    let label = if has_label {
+        let len = label_buf.iter().position(|&c| c == 0).unwrap_or(0);
+        String::from_utf16_lossy(&label_buf[..len])
+    } else {
+        String::new()
+    };
+    DriveDetails { letter: d.letter.clone(), root: d.root.clone(), label, total, free, removable }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn drive_details(d: &DriveInfo) -> DriveDetails {
+    DriveDetails { letter: d.letter.clone(), root: d.root.clone(), label: String::new(), total: 0, free: 0, removable: false }
+}
+
 #[tauri::command]
 fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let dir = Path::new(&path);
@@ -153,9 +206,29 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let mut result: Vec<FileEntry> = entries
         .filter_map(|e| e.ok())
         .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
+            let mut metadata = entry.metadata().ok()?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let entry_path = entry.path().to_string_lossy().into_owned();
+
+            #[cfg(target_os = "windows")]
+            let hidden = {
+                use std::os::windows::fs::MetadataExt;
+                const HIDDEN: u32 = 0x2;
+                const SYSTEM: u32 = 0x4;
+                const REPARSE_POINT: u32 = 0x400;
+                let attrs = metadata.file_attributes();
+                // Accesos de Windows a carpetas (junctions/symlinks, p. ej. "Documents and Settings"):
+                // read_dir no los sigue; se usan los datos del destino para que aparezcan como carpeta
+                if attrs & REPARSE_POINT != 0 {
+                    if let Ok(target) = std::fs::metadata(entry.path()) {
+                        metadata = target;
+                    }
+                }
+                attrs & (HIDDEN | SYSTEM) != 0
+            };
+            #[cfg(not(target_os = "windows"))]
+            let hidden = name.starts_with('.');
+
             let is_dir = metadata.is_dir();
             let size = if is_dir { 0 } else { metadata.len() };
             let extension = if is_dir {
@@ -174,7 +247,7 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            Some(FileEntry { name, path: entry_path, is_dir, size, modified, extension })
+            Some(FileEntry { name, path: entry_path, is_dir, size, modified, extension, hidden })
         })
         .collect();
 
@@ -326,6 +399,19 @@ async fn scan_robocopy(
         return Err("cancelado".into());
     }
     Ok(decode_cmd_output(&out))
+}
+
+// Abre una carpeta en el Explorador de Windows (botón "Abrir destino" del resumen)
+#[tauri::command]
+fn open_in_explorer(path: String) -> Result<(), String> {
+    if !Path::new(&path).is_dir() {
+        return Err(format!("La carpeta no existe: {}", path));
+    }
+    std::process::Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // Para arrastrar y soltar: indica cuáles de las rutas son carpetas
@@ -1125,6 +1211,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_drives,
+            list_drive_details,
             list_directory,
             get_parent_path,
             run_robocopy,
@@ -1132,6 +1219,7 @@ pub fn run() {
             scan_robocopy,
             reset_cancel,
             paths_are_dirs,
+            open_in_explorer,
             is_elevated,
             relaunch_as_admin,
             take_relaunch_state,

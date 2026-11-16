@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getFileType } from "../fileTypes";
 
 // ─── Interpreta el exit code de robocopy ────────────────────────────────────
 
@@ -160,30 +161,6 @@ const LINE_COLORS = {
 
 // ─── Helpers para vista de copia en vivo ────────────────────────────────────
 
-function getFileType(ext) {
-  const e = (ext || "").toLowerCase();
-  if (e === "pdf")
-    return { label: "PDF",   short: "PDF", bg: "bg-red-900/80",    fg: "text-red-300",    bar: "bg-red-500"    };
-  if (["mp4","avi","mov","mkv","wmv","flv","webm"].includes(e))
-    return { label: "VIDEO", short: "VID", bg: "bg-purple-900/80", fg: "text-purple-300", bar: "bg-purple-500" };
-  if (["mp3","wav","flac","aac","ogg","m4a"].includes(e))
-    return { label: "AUDIO", short: "AUD", bg: "bg-pink-900/80",   fg: "text-pink-300",   bar: "bg-pink-500"   };
-  if (["doc","docx"].includes(e))
-    return { label: "WORD",  short: "DOC", bg: "bg-blue-900/80",   fg: "text-blue-300",   bar: "bg-blue-500"   };
-  if (["xls","xlsx","csv"].includes(e))
-    return { label: "EXCEL", short: "XLS", bg: "bg-green-900/80",  fg: "text-green-300",  bar: "bg-green-500"  };
-  if (["ppt","pptx"].includes(e))
-    return { label: "PPT",   short: "PPT", bg: "bg-orange-900/80", fg: "text-orange-300", bar: "bg-orange-500" };
-  if (["jpg","jpeg","png","gif","bmp","svg","webp","tiff","heic"].includes(e))
-    return { label: "IMG",   short: "IMG", bg: "bg-yellow-900/80", fg: "text-yellow-300", bar: "bg-yellow-500" };
-  if (["zip","rar","7z","tar","gz","bz2"].includes(e))
-    return { label: "ZIP",   short: "ZIP", bg: "bg-gray-700/80",   fg: "text-gray-300",   bar: "bg-gray-500"   };
-  if (["exe","msi","bat","cmd"].includes(e))
-    return { label: "APP",   short: "APP", bg: "bg-cyan-900/80",   fg: "text-cyan-300",   bar: "bg-cyan-500"   };
-  const s = e.slice(0, 3).toUpperCase() || "???";
-  return { label: s, short: s, bg: "bg-gray-800/80", fg: "text-gray-400", bar: "bg-gray-500" };
-}
-
 function parseFileLine(line) {
   // Formato: "\tNew File \t\t  1.23 m\tfilename.pdf" — el nombre es el último segmento por tab
   const segs = line.split("\t").map(s => s.trim()).filter(Boolean);
@@ -314,47 +291,102 @@ function TagInput({ tags, onChange, placeholder }) {
 
 // ─── Tarjeta de resumen post-copia ───────────────────────────────────────────
 
-function SummaryCard({ summary, exitCode }) {
-  const result = interpretExitCode(exitCode);
+function SummaryCard({ summary, exitCode, elapsedMs, destPath, isDryRun }) {
+  const result  = interpretExitCode(exitCode);
+  const failed  = exitCode >= 8;
+  const files   = summary.files;
+  const [openErr, setOpenErr] = useState(null);
+
+  // Barra apilada: copiados / omitidos / fallidos sobre el total de archivos
+  const segs = files && files.total > 0 ? [
+    { key: "copied",  n: files.copied,  label: isDryRun ? "a copiar" : "copiados", bar: "bg-emerald-500", dot: "bg-emerald-500", text: "text-emerald-400" },
+    { key: "skipped", n: files.skipped, label: "omitidos (ya estaban)",           bar: "bg-gray-600",    dot: "bg-gray-500",    text: "text-gray-400" },
+    { key: "failed",  n: files.failed,  label: "fallidos",                        bar: "bg-red-500",     dot: "bg-red-500",     text: "text-red-400" },
+  ].filter(s => s.n > 0) : [];
+
+  async function openDest() {
+    setOpenErr(null);
+    try { await invoke("open_in_explorer", { path: destPath }); }
+    catch (e) { setOpenErr(String(e)); }
+  }
 
   return (
-    <div className={`mx-4 mt-4 p-4 rounded-xl border ${exitCode >= 8 ? "border-red-800 bg-red-950/30" : "border-emerald-800 bg-emerald-950/20"}`}>
-      <div className="flex items-center justify-between mb-3">
-        <h3 className={`font-semibold text-sm ${result.color}`}>{result.label}</h3>
-        <span className="text-xs text-gray-600">Código de salida: {exitCode}</span>
+    <div className={`mx-4 mt-4 rounded-xl border overflow-hidden motion-safe:animate-fade-in
+      ${failed ? "border-red-800/80 bg-red-950/20" : "border-emerald-800/70 bg-emerald-950/10"}`}>
+
+      {/* Encabezado: resultado + acciones */}
+      <div className="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-gray-800/80">
+        <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0
+          ${failed ? "bg-red-900/60 text-red-300" : exitCode === 0 ? "bg-gray-800 text-gray-300" : "bg-emerald-900/60 text-emerald-300"}`}>
+          {failed ? (
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4"><path d="M18 6 6 18M6 6l12 12" /></svg>
+          ) : (
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4"><polyline points="20 6 9 17 4 12" /></svg>
+          )}
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className={`font-semibold text-sm ${result.color}`}>
+            {isDryRun ? `Simulación — ${result.label.toLowerCase()}` : result.label}
+          </h3>
+          <p className="text-xs text-gray-500 truncate">{result.desc}</p>
+        </div>
+        {elapsedMs != null && (
+          <span className="flex items-center gap-1.5 text-xs text-gray-400 font-mono tabular-nums shrink-0" title="Tiempo total (incluye el cálculo inicial)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5"><circle cx="12" cy="12" r="9" /><polyline points="12 7 12 12 15 14" /></svg>
+            {formatDuration(elapsedMs / 1000)}
+          </span>
+        )}
+        {destPath && !isDryRun && (
+          <button onClick={openDest} title={destPath}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 transition-colors shrink-0">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>
+            Abrir destino
+          </button>
+        )}
       </div>
 
-      <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 text-xs sm:grid-cols-4">
-        {summary.files && (
-          <>
-            <Stat label="Archivos copiados" value={summary.files.copied} color="text-emerald-400" />
-            <Stat label="Archivos totales"  value={summary.files.total}  color="text-gray-300" />
-            <Stat label="Omitidos"          value={summary.files.skipped} color="text-gray-500" />
-            <Stat label="Fallidos"          value={summary.files.failed}  color={summary.files.failed > 0 ? "text-red-400" : "text-gray-500"} />
-          </>
+      <div className="px-4 py-3 space-y-3">
+        {/* Números grandes */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {files && <BigStat label={isDryRun ? "Archivos a copiar" : "Archivos copiados"} value={files.copied.toLocaleString("es")} sub={`de ${files.total.toLocaleString("es")}`} color="text-emerald-400" />}
+          {summary.bytes && <BigStat label={isDryRun ? "Datos a copiar" : "Datos copiados"} value={formatBytes(summary.bytes.copied)} sub={summary.bytes.total !== summary.bytes.copied ? `de ${formatBytes(summary.bytes.total)}` : null} color="text-cyan-400" />}
+          {summary.speed && !isDryRun && <BigStat label="Velocidad media" value={summary.speed} color="text-yellow-400" />}
+          {summary.dirs && <BigStat label="Carpetas" value={summary.dirs.copied.toLocaleString("es")} sub={`nuevas de ${summary.dirs.total.toLocaleString("es")}`} color="text-blue-400" />}
+        </div>
+
+        {/* Barra apilada de archivos */}
+        {segs.length > 0 && (
+          <div>
+            <div className="flex h-2 rounded-full overflow-hidden bg-gray-800">
+              {segs.map(s => (
+                <div key={s.key} className={`${s.bar} h-full transition-all duration-500`}
+                  style={{ width: `${(s.n / files.total) * 100}%`, minWidth: "3px" }}
+                  title={`${s.n} ${s.label}`} />
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-[11px]">
+              {segs.map(s => (
+                <span key={s.key} className="flex items-center gap-1.5 text-gray-500">
+                  <span className={`w-2 h-2 rounded-full ${s.dot}`} />
+                  <span className={`font-mono font-semibold ${s.text}`}>{s.n.toLocaleString("es")}</span> {s.label}
+                </span>
+              ))}
+              <span className="ml-auto text-gray-600">código {exitCode}</span>
+            </div>
+          </div>
         )}
-        {summary.dirs && (
-          <>
-            <Stat label="Carpetas copiadas" value={summary.dirs.copied}  color="text-blue-400" />
-            <Stat label="Carpetas totales"  value={summary.dirs.total}   color="text-gray-300" />
-          </>
-        )}
-        {summary.bytes && (
-          <Stat label="Datos copiados" value={formatBytes(summary.bytes.copied)} color="text-cyan-400" />
-        )}
-        {summary.speed && (
-          <Stat label="Velocidad" value={summary.speed} color="text-yellow-400" />
-        )}
+        {openErr && <p className="text-xs text-red-400">{openErr}</p>}
       </div>
     </div>
   );
 }
 
-function Stat({ label, value, color }) {
+function BigStat({ label, value, sub, color }) {
   return (
-    <div>
-      <p className="text-gray-600">{label}</p>
-      <p className={`font-mono font-semibold ${color}`}>{value}</p>
+    <div className="px-3 py-2 rounded-lg bg-gray-900/60 border border-gray-800/80 min-w-0">
+      <p className="text-[11px] text-gray-500 truncate">{label}</p>
+      <p className={`text-lg font-mono font-bold tabular-nums leading-tight truncate ${color}`}>{value}</p>
+      {sub && <p className="text-[11px] text-gray-600 truncate">{sub}</p>}
     </div>
   );
 }
@@ -422,6 +454,9 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [, setTick]             = useState(0);    // refresca el tiempo restante cada segundo
   const progRef      = useRef({ doneBytes: 0, doneFiles: 0, curSize: 0, curPct: 0, active: false, start: 0 });
   const cancelReqRef = useRef(false);
+  // Datos de la última corrida para la tarjeta de resumen
+  const [lastRun, setLastRun] = useState(null); // { dest, dryRun, elapsedMs }
+  const runStartRef  = useRef(0);
   // Arrastrar y soltar desde el Explorador de Windows
   const [dragTarget, setDragTarget] = useState(null); // null = sin arrastre; "none" | "source" | "dest"
   const [dropMsg, setDropMsg]       = useState(null);
@@ -504,11 +539,6 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
   }, [outputLines]);
 
-  // Reporta estado de copia al componente padre (para la barra en segundo plano)
-  useEffect(() => {
-    const ft = liveFile ? getFileType(liveFile.ext) : null;
-    onStatusChange?.({ running, liveFile, ft, fileCount });
-  }, [running, liveFile, fileCount]);
 
   // Mientras copia, re-renderiza cada segundo para que velocidad/tiempo restante no se congelen
   useEffect(() => {
@@ -726,6 +756,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
     const flags = buildFlags();
     const multi = sourceFolders.length > 0;
+    runStartRef.current = Date.now();
+    setLastRun({ dest: multi ? dest : effectiveDest, dryRun: isDryRun, elapsedMs: null });
 
     // ── Pre-escaneo: cuánto hay que copiar (para progreso total y tiempo restante) ──
     cancelReqRef.current = false;
@@ -828,6 +860,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
     const finishRun = async (code) => {
       progFlush();
+      setLastRun(prev => prev && { ...prev, elapsedMs: Date.now() - runStartRef.current });
       setExitCode(code);
       setRunning(false);
       setLiveFile(null);
@@ -963,6 +996,13 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     const eta = speed && elapsed >= 3 && totals.bytes > 0 ? Math.max(0, totals.bytes - done.bytes) / speed : null;
     return { pct, speed, eta };
   })();
+
+  // Reporta estado de copia al componente padre (barra en segundo plano + barra de tareas de Windows)
+  const pctRounded = progress ? Math.floor(progress.pct) : null;
+  useEffect(() => {
+    const ft = liveFile ? getFileType(liveFile.ext) : null;
+    onStatusChange?.({ running, liveFile, ft, fileCount, pct: pctRounded, scanning, exitCode });
+  }, [running, liveFile, fileCount, pctRounded, scanning, exitCode]);
   const result  = exitCode !== null ? interpretExitCode(exitCode) : null;
   const isDryRun = options["/L"];
 
@@ -1357,7 +1397,8 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
       {/* ── Tarjeta de resumen (al terminar) ───────────────────────────────── */}
       {summary && exitCode !== null && !running && (
-        <SummaryCard summary={summary} exitCode={exitCode} />
+        <SummaryCard summary={summary} exitCode={exitCode}
+          elapsedMs={lastRun?.elapsedMs} destPath={lastRun?.dest} isDryRun={lastRun?.dryRun} />
       )}
 
       {/* ── Panel de errores (al terminar con código >= 8) ──────────────────── */}
@@ -1399,10 +1440,20 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
 
         {/* Estado vacío — antes de correr */}
         {outputLines.length === 0 && !running && recentFiles.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-40 text-gray-700">
-            <p className="text-4xl mb-3">⚡</p>
-            <p className="text-sm">El output de Robocopy aparecerá aquí en tiempo real</p>
-          </div>
+          <StartGuide
+            source={source}
+            dest={dest}
+            sourceLabel={sourceFolders.length > 0 ? `${sourceFolders.length} carpeta(s) de ${source}` : sourceFiles.length > 0 ? `${sourceFiles.length} archivo(s) de ${source}` : source}
+            destLabel={effectiveDest}
+            canRun={canRun}
+            blocker={pathError || (needsAdmin ? "El modo backup (/B) necesita administrador." : null)}
+            isDryRun={isDryRun}
+            showDragHint={!elevated}
+            onPickSource={async () => { try { const p = await openDialog({ directory: true, title: "Carpeta Origen" }); if (p) onSourceChange(p); } catch (_) {} }}
+            onPickDest={async () => { try { const p = await openDialog({ directory: true, title: "Carpeta Destino" }); if (p) onDestChange(p); } catch (_) {} }}
+            onGoToExplorer={onGoToExplorer}
+            onStart={startRobocopy}
+          />
         )}
 
         {outputLines.length > 0 && (
@@ -1455,6 +1506,93 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         )}
       </div>
     </div>
+  );
+}
+
+// ─── Guía de inicio (cuando todavía no se corrió nada) ───────────────────────
+
+function StartGuide({ source, dest, sourceLabel, destLabel, canRun, blocker, isDryRun, showDragHint,
+                      onPickSource, onPickDest, onGoToExplorer, onStart }) {
+  const steps = [
+    { n: 1, title: "Elegí qué copiar",  done: !!source, value: sourceLabel, color: "emerald", onPick: onPickSource },
+    { n: 2, title: "Elegí a dónde",     done: !!dest,   value: destLabel,   color: "purple",  onPick: onPickDest },
+  ];
+  const activeStep = !source ? 1 : !dest ? 2 : 3;
+
+  return (
+    <div className="max-w-3xl mx-auto px-4 py-8">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {steps.map(s => {
+          const active = activeStep === s.n;
+          const ring = s.done
+            ? (s.color === "emerald" ? "border-emerald-800/70 bg-emerald-950/20" : "border-purple-800/70 bg-purple-950/20")
+            : active ? "border-blue-700/70 bg-blue-950/20" : "border-gray-800 bg-gray-900/40";
+          return (
+            <div key={s.n} className={`p-4 rounded-xl border transition-colors ${ring}`}>
+              <div className="flex items-center gap-2 mb-2">
+                <StepBadge n={s.n} done={s.done} active={active} />
+                <p className="text-sm font-medium text-gray-200">{s.title}</p>
+              </div>
+              {s.done ? (
+                <p className={`text-xs font-mono truncate ${s.color === "emerald" ? "text-emerald-400" : "text-purple-400"}`} title={s.value}>{s.value}</p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  <button onClick={s.onPick}
+                    className="px-2.5 py-1 rounded-md text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 transition-colors">
+                    🗂 Elegir carpeta
+                  </button>
+                  {s.n === 1 && (
+                    <button onClick={onGoToExplorer}
+                      className="px-2.5 py-1 rounded-md text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-400 transition-colors">
+                      📂 Explorador
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Paso 3: iniciar */}
+        <div className={`p-4 rounded-xl border transition-colors ${activeStep === 3 && canRun ? "border-blue-700/70 bg-blue-950/20" : "border-gray-800 bg-gray-900/40"}`}>
+          <div className="flex items-center gap-2 mb-2">
+            <StepBadge n={3} done={false} active={activeStep === 3} />
+            <p className="text-sm font-medium text-gray-200">{isDryRun ? "Simular" : "Copiar"}</p>
+          </div>
+          {canRun ? (
+            <button onClick={onStart}
+              className={`px-3 py-1 rounded-md text-xs font-semibold text-white transition-colors ${isDryRun ? "bg-sky-700 hover:bg-sky-600" : "bg-blue-600 hover:bg-blue-500"}`}>
+              {isDryRun ? "🔍 Simular ahora" : "▶ Iniciar copia"}
+            </button>
+          ) : (
+            <p className={`text-xs ${blocker && activeStep === 3 ? "text-amber-400" : "text-gray-600"}`}>
+              {activeStep === 3 && blocker ? blocker : "Completá los pasos 1 y 2"}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {showDragHint && activeStep < 3 && (
+        <div className="mt-4 flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 border-dashed border-gray-800 text-xs text-gray-500">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4 shrink-0">
+            <path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14" />
+          </svg>
+          También podés arrastrar carpetas desde el Explorador de Windows a los campos de arriba
+        </div>
+      )}
+      <p className="mt-6 text-center text-[11px] text-gray-700">El progreso y el log de Robocopy van a aparecer acá</p>
+    </div>
+  );
+}
+
+function StepBadge({ n, done, active }) {
+  return (
+    <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0
+      ${done ? "bg-emerald-600 text-white" : active ? "bg-blue-600 text-white" : "bg-gray-800 text-gray-500"}`}>
+      {done ? (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="w-3.5 h-3.5"><polyline points="20 6 9 17 4 12" /></svg>
+      ) : n}
+    </span>
   );
 }
 

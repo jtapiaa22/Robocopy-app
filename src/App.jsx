@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { version } from "../package.json";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, ProgressBarStatus, UserAttentionType } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
@@ -112,6 +112,52 @@ export default function App() {
     setLoadedJob({ ...job, _ts: Date.now() });
     setActiveTab("robocopy");
   }
+
+  // ── Progreso en la barra de tareas de Windows + título de la ventana ──
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const ignore = () => {};
+    const { running, pct, scanning, exitCode } = copyStatus;
+
+    if (running) {
+      wasRunningRef.current = true;
+      if (pct != null) {
+        win.setProgressBar({ status: ProgressBarStatus.Normal, progress: pct }).catch(ignore);
+        win.setTitle(`${pct}% — RoboCopy GUI`).catch(ignore);
+      } else {
+        win.setProgressBar({ status: ProgressBarStatus.Indeterminate }).catch(ignore);
+        win.setTitle(`${scanning ? "Calculando…" : "Copiando…"} — RoboCopy GUI`).catch(ignore);
+      }
+      return;
+    }
+
+    win.setTitle("RoboCopy GUI").catch(ignore);
+    if (!wasRunningRef.current) return;
+    wasRunningRef.current = false;
+
+    // Terminó: con error queda en rojo hasta que vuelvas a la ventana; si salió bien, se limpia
+    if (exitCode != null && exitCode >= 8) {
+      win.setProgressBar({ status: ProgressBarStatus.Error, progress: 100 }).catch(ignore);
+    } else {
+      win.setProgressBar({ status: ProgressBarStatus.None }).catch(ignore);
+    }
+    // Si la ventana no está al frente, el ícono parpadea para avisar que terminó
+    win.isFocused().then(focused => {
+      if (!focused) win.requestUserAttention(UserAttentionType.Informational).catch(ignore);
+    }).catch(ignore);
+  }, [copyStatus.running, copyStatus.pct, copyStatus.scanning, copyStatus.exitCode]);
+
+  // Al volver a la ventana se limpia el rojo de error de la barra de tareas
+  useEffect(() => {
+    let unlisten = null, alive = true;
+    getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused && !wasRunningRef.current) {
+        getCurrentWindow().setProgressBar({ status: ProgressBarStatus.None }).catch(() => {});
+      }
+    }).then(fn => { if (alive) unlisten = fn; else fn(); }).catch(() => {});
+    return () => { alive = false; unlisten?.(); };
+  }, []);
 
   // ── Administrador bajo demanda ──
   // La app arranca sin admin; clonar discos y /B la relanzan elevada conservando el estado.
