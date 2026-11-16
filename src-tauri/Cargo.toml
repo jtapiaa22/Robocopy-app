@@ -1,6 +1,6 @@
 [package]
 name = "robocopy-app"
-version = "3.1.0"
+version = "3.2.0"
 description = "RoboCopy GUI - Visual file copy tool for Windows"
 authors = ["Jorge"]
 edition = "2021"
