@@ -28,9 +28,20 @@ fs.writeFileSync(tauriPath, JSON.stringify(tauri, null, 2) + "\n");
 const cargo = fs.readFileSync(cargoPath, "utf-8");
 fs.writeFileSync(cargoPath, cargo.replace(/^version\s*=\s*"[^"]*"/m, `version = "${newVersion}"`));
 
+// Cargo.lock: la versión del propio paquete (si no, cargo la cambia al compilar y
+// `npm run publish` frena por "cambios sin commitear")
+const lockPath = path.resolve(__dirname, "../src-tauri/Cargo.lock");
+if (fs.existsSync(lockPath)) {
+  const lock = fs.readFileSync(lockPath, "utf-8");
+  fs.writeFileSync(lockPath, lock.replace(
+    /(\[\[package\]\]\r?\nname = "robocopy-app"\r?\nversion = )"[^"]*"/,
+    `$1"${newVersion}"`,
+  ));
+}
+
 console.log(`\n✓  ${prev}  →  ${newVersion}`);
-console.log(`   package.json + tauri.conf.json + Cargo.toml actualizados`);
+console.log(`   package.json + tauri.conf.json + Cargo.toml + Cargo.lock actualizados`);
 console.log(`\n   Siguiente paso:`);
-console.log(`   git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml`);
+console.log(`   git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock`);
 console.log(`   git commit -m "v${newVersion}"`);
 console.log(`   npm run publish\n`);
