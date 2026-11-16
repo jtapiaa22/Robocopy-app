@@ -328,6 +328,104 @@ async fn scan_robocopy(
     Ok(decode_cmd_output(&out))
 }
 
+// Para arrastrar y soltar: indica cuáles de las rutas son carpetas
+#[tauri::command]
+fn paths_are_dirs(paths: Vec<String>) -> Vec<bool> {
+    paths.iter().map(|p| Path::new(p).is_dir()).collect()
+}
+
+// ─── Comandos: elevación (administrador bajo demanda) ────────────────────────
+//
+// La app arranca sin admin (así funciona arrastrar desde el Explorador, que Windows
+// bloquea hacia ventanas elevadas). Clonar discos y el modo /B sí necesitan admin:
+// para eso la app se relanza elevada, guardando antes su estado para restaurarlo.
+
+const RELAUNCH_ARG: &str = "--elevated-relaunch";
+
+fn relaunch_state_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("relaunch_state.json"))
+}
+
+#[tauri::command]
+fn is_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+// Abre una nueva instancia elevada (aparece el UAC) y cierra esta.
+// `state` es un JSON del frontend (pestaña, rutas, opciones) para continuar donde estaba.
+#[tauri::command]
+fn relaunch_as_admin(app: tauri::AppHandle, state: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let state_path = relaunch_state_path(&app);
+        if let (Some(path), Some(s)) = (&state_path, &state) {
+            if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+            std::fs::write(path, s).map_err(|e| e.to_string())?;
+        }
+
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let wide = |s: &std::ffi::OsStr| s.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let verb = wide(std::ffi::OsStr::new("runas"));
+        let file = wide(exe.as_os_str());
+        let params = wide(std::ffi::OsStr::new(RELAUNCH_ARG));
+
+        let result = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), std::ptr::null(), SW_SHOWNORMAL)
+        };
+        // ShellExecuteW devuelve > 32 si lanzó; si no (p. ej. el usuario canceló el UAC) seguimos como estábamos
+        if (result as isize) <= 32 {
+            if let Some(path) = &state_path { let _ = std::fs::remove_file(path); }
+            return Err("No se otorgaron permisos de administrador.".into());
+        }
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, state);
+        Err("Solo disponible en Windows".into())
+    }
+}
+
+// Si esta instancia viene de un relanzamiento elevado, devuelve (y borra) el estado guardado
+#[tauri::command]
+fn take_relaunch_state(app: tauri::AppHandle) -> Option<String> {
+    if !std::env::args().any(|a| a == RELAUNCH_ARG) {
+        return None;
+    }
+    let path = relaunch_state_path(&app)?;
+    let s = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    s
+}
+
 // Marca el inicio de una nueva operación (limpia una cancelación anterior)
 #[tauri::command]
 fn reset_cancel(app: tauri::AppHandle) {
@@ -1033,6 +1131,10 @@ pub fn run() {
             run_robocopy_multi,
             scan_robocopy,
             reset_cancel,
+            paths_are_dirs,
+            is_elevated,
+            relaunch_as_admin,
+            take_relaunch_state,
             nudge_robocopy,
             cancel_robocopy,
             save_job,

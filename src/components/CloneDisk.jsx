@@ -149,7 +149,8 @@ function DiskSelector({ disks, selected, onSelect, label, excludeIndex, disabled
   );
 }
 
-export default function CloneDisk({ onCloningChange }) {
+export default function CloneDisk({ onCloningChange, elevated = false, onRelaunchAdmin }) {
+  const [adminErr, setAdminErr] = useState(null);
   const [disks, setDisks]         = useState([]);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState(null);
@@ -191,7 +192,7 @@ export default function CloneDisk({ onCloningChange }) {
 
   const canStart = source && dest && !source.isSystem && !source.isBoot
     && !dest.isSystem && !dest.isBoot
-    && dest.size >= source.size && !cloning;
+    && dest.size >= source.size && !cloning && elevated;
 
   const destWarning = dest && source && dest.size < source.size
     ? `El destino (${fmtSize(dest.size)}) es más chico que el origen (${fmtSize(source.size)})`
@@ -281,6 +282,23 @@ export default function CloneDisk({ onCloningChange }) {
           </button>
         </div>
       </div>
+
+      {/* ── Requiere administrador ──────────────────────────────────────────── */}
+      {!elevated && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 bg-amber-950/40 border border-amber-800/60 rounded-xl text-xs text-amber-300 shrink-0">
+          <span className="flex-1 min-w-0">
+            Clonar discos necesita permisos de administrador (escribe directo sobre el disco).
+            Podés elegir los discos ahora; para iniciar la clonación reiniciá la app como administrador.
+            {adminErr && <span className="block text-red-300 mt-0.5">{adminErr}</span>}
+          </span>
+          <button
+            onClick={async () => { setAdminErr(null); const err = await onRelaunchAdmin?.(); if (err) setAdminErr(err); }}
+            className="px-3 py-1.5 rounded-md bg-amber-700 hover:bg-amber-600 text-white font-medium shrink-0"
+          >
+            🛡 Reiniciar como administrador
+          </button>
+        </div>
+      )}
 
       {/* ── Error de carga ──────────────────────────────────────────────────── */}
       {error && (

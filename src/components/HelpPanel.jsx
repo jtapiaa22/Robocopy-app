@@ -43,7 +43,7 @@ const SECTIONS = [
         color: "gray",
         desc: "Usa privilegios especiales de Windows para copiar archivos que normalmente estarían bloqueados por permisos de seguridad, como archivos del sistema o de otras cuentas de usuario.",
         example: 'robocopy "C:\\Windows\\System32" "D:\\Copia" /B',
-        tip: "Requiere ejecutar la app como administrador.",
+        tip: "Requiere administrador: al activarlo, la app te ofrece reiniciarse elevada con la misma configuración.",
       },
       {
         flag: "/XO",

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 // ─── Interpreta el exit code de robocopy ────────────────────────────────────
 
@@ -105,6 +106,19 @@ function formatDuration(secs) {
 
 function normWinPath(p) {
   return (p || "").trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+// "E:\UNCA\x" → "E:\UNCA";  "E:\UNCA" → "E:\"
+function parentWinPath(p) {
+  const c = (p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(c.lastIndexOf("\\"), c.lastIndexOf("/"));
+  if (i < 0) return c;
+  const par = c.slice(0, i);
+  return /^[a-zA-Z]:$/.test(par) ? par + "\\" : par;
+}
+
+function baseWinName(p) {
+  return (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
 }
 
 function joinWinPath(parent, child) {
@@ -372,7 +386,7 @@ function trackErrorLine(line, pendingErrRef, setErrorFiles) {
 
 // ─── Componente principal ────────────────────────────────────────────────────
 
-export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onDestChange, onGoToExplorer, loadedJob, onJobSaved, onStatusChange }) {
+export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFolders = [], onSourceChange, onSourceSelect, onDestChange, onGoToExplorer, loadedJob, onJobSaved, onStatusChange, elevated = false, onRelaunchAdmin }) {
   const [options, setOptions]           = useState({ ...DEFAULT_OPTIONS });
   const [retries, setRetries]           = useState("3");
   const [waitTime, setWaitTime]         = useState("5");
@@ -408,6 +422,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const [, setTick]             = useState(0);    // refresca el tiempo restante cada segundo
   const progRef      = useRef({ doneBytes: 0, doneFiles: 0, curSize: 0, curPct: 0, active: false, start: 0 });
   const cancelReqRef = useRef(false);
+  // Arrastrar y soltar desde el Explorador de Windows
+  const [dragTarget, setDragTarget] = useState(null); // null = sin arrastre; "none" | "source" | "dest"
+  const [dropMsg, setDropMsg]       = useState(null);
+  const rootRef       = useRef(null);
+  const srcFieldRef   = useRef(null);
+  const dstFieldRef   = useRef(null);
+  const dropMsgTimer  = useRef(null);
+  const dropHandler   = useRef(null);
 
   // Nombre de la carpeta origen (null si es raíz de unidad, p. ej. "E:\")
   const sourceFolderName = (() => {
@@ -455,7 +477,12 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   useEffect(() => {
     if (!loadedJob) return;
     const cfg = loadedJob.config || {};
-    onSourceChange(loadedJob.source);
+    // Un relanzamiento como admin también trae la selección de carpetas/archivos
+    if (loadedJob.sourceFolders?.length || loadedJob.sourceFiles?.length) {
+      onSourceSelect?.(loadedJob.source, loadedJob.sourceFiles ?? [], loadedJob.sourceFolders ?? []);
+    } else {
+      onSourceChange(loadedJob.source);
+    }
     onDestChange(loadedJob.destination);
     setOptions(cfg.options ?? { ...DEFAULT_OPTIONS });
     setRetries(cfg.retries ?? "3");
@@ -519,6 +546,83 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     if (p.active) { p.doneBytes += p.curSize; p.doneFiles += 1; p.active = false; }
     pushOverall();
   }
+
+  // ── Arrastrar y soltar ──
+  function flashDropMsg(msg) {
+    setDropMsg(msg);
+    clearTimeout(dropMsgTimer.current);
+    dropMsgTimer.current = setTimeout(() => setDropMsg(null), 5000);
+  }
+
+  // ¿Sobre qué campo está el cursor? Tauri da la posición en píxeles físicos.
+  function dropZoneAt(pos) {
+    if (!pos) return "none";
+    const ratio = window.devicePixelRatio || 1;
+    const x = pos.x / ratio, y = pos.y / ratio;
+    const inside = el => {
+      if (!el) return false;
+      const b = el.getBoundingClientRect();
+      return b.width > 0 && x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
+    };
+    if (inside(srcFieldRef.current)) return "source";
+    if (inside(dstFieldRef.current)) return "dest";
+    return "none";
+  }
+
+  async function handleDrop(zone, paths) {
+    if (!paths.length) return;
+    if (zone === "none") { flashDropMsg("Soltalo sobre el campo Origen o Destino."); return; }
+
+    let dirs;
+    try { dirs = await invoke("paths_are_dirs", { paths }); }
+    catch (e) { flashDropMsg(`No se pudo leer lo que soltaste: ${e}`); return; }
+
+    if (zone === "dest") {
+      if (paths.length !== 1 || !dirs[0]) { flashDropMsg("El destino tiene que ser una sola carpeta."); return; }
+      onDestChange(paths[0]);
+      setDropMsg(null);
+      return;
+    }
+
+    // Origen: una carpeta sola → se usa directamente (aplica "Crear carpeta en destino")
+    if (paths.length === 1 && dirs[0]) {
+      onSourceChange(paths[0]);
+      setDropMsg(null);
+      return;
+    }
+    // Varios elementos o archivos sueltos → igual que seleccionarlos en el Explorador de la app
+    const parents = new Set(paths.map(p => normWinPath(parentWinPath(p))));
+    if (parents.size > 1) { flashDropMsg("Lo que soltás en Origen tiene que estar en la misma carpeta."); return; }
+    const folders = paths.filter((_, i) =>  dirs[i]).map(baseWinName);
+    const files   = paths.filter((_, i) => !dirs[i]).map(baseWinName);
+    onSourceSelect?.(parentWinPath(paths[0]), folders.length > 0 ? [] : files, folders);
+    if (folders.length > 0 && files.length > 0) {
+      flashDropMsg(`Se copian las ${folders.length} carpeta(s). Los ${files.length} archivo(s) sueltos se ignoran: no se pueden mezclar carpetas y archivos en una misma copia.`);
+    } else {
+      setDropMsg(null);
+    }
+  }
+
+  // El listener se registra una sola vez; usa siempre la versión actual de los handlers
+  dropHandler.current = {
+    // Solo si este panel está visible (las pestañas ocultas usan display:none) y no hay copia en curso
+    enabled: () => !running && !!rootRef.current && rootRef.current.offsetParent !== null,
+    zoneAt: dropZoneAt,
+    drop: handleDrop,
+  };
+
+  useEffect(() => {
+    let unlisten = null, alive = true;
+    getCurrentWebview().onDragDropEvent(event => {
+      const h = dropHandler.current;
+      const { type, position, paths } = event.payload;
+      if (!h.enabled()) { setDragTarget(null); return; }
+      if (type === "enter" || type === "over") setDragTarget(h.zoneAt(position));
+      else if (type === "drop") { setDragTarget(null); h.drop(h.zoneAt(position), paths || []); }
+      else setDragTarget(null); // leave
+    }).then(fn => { if (alive) unlisten = fn; else fn(); }).catch(() => {});
+    return () => { alive = false; unlisten?.(); clearTimeout(dropMsgTimer.current); };
+  }, []);
 
   // Limpia listeners al desmontar
   useEffect(() => () => unlistenRef.current.forEach(fn => fn()), []);
@@ -823,7 +927,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         name: saveName.trim(),
         source,
         destination: dest,
-        config: { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter, maxAge, includeParent },
+        config: currentConfig(),
         created_at: Math.floor(Date.now() / 1000),
       },
     });
@@ -832,7 +936,20 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     onJobSaved?.();
   }
 
-  const canRun  = !!(source && dest && !running && !pathError);
+  function currentConfig() {
+    return { options, retries, waitTime, mtEnabled, mtThreads, excludeFiles, excludeDirs, fileFilter, maxAge, includeParent };
+  }
+
+  // /B (modo backup) necesita privilegios de administrador
+  const needsAdmin = !!options["/B"] && !elevated;
+  const [adminErr, setAdminErr] = useState(null);
+  async function handleRelaunchAdmin() {
+    setAdminErr(null);
+    const err = await onRelaunchAdmin?.({ source, destination: dest, sourceFolders, sourceFiles, config: currentConfig() });
+    if (err) setAdminErr(err);
+  }
+
+  const canRun  = !!(source && dest && !running && !pathError && !needsAdmin);
 
   // Progreso total (solo si el pre-escaneo dio resultado)
   const progress = (() => {
@@ -850,16 +967,38 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   const isDryRun = options["/L"];
 
   return (
-    <div className="flex flex-col h-full bg-gray-950 text-gray-100 overflow-y-auto">
+    <div ref={rootRef} className="flex flex-col h-full bg-gray-950 text-gray-100 overflow-y-auto">
 
       {/* ── Rutas ──────────────────────────────────────────────────────────── */}
       <div className="p-4 bg-gray-900 border-b border-gray-800 shrink-0 space-y-3">
         <div className="grid grid-cols-2 gap-4">
           <PathField label="Carpeta Origen"  value={source} onChange={onSourceChange}
-            color="emerald" placeholder="C:\ruta\de\origen"  onBrowse={onGoToExplorer} />
+            color="emerald" placeholder={elevated ? "C:\\ruta\\de\\origen" : "C:\\ruta\\de\\origen  (o arrastrá una carpeta acá)"}  onBrowse={onGoToExplorer}
+            fieldRef={srcFieldRef} dropState={dragTarget && (dragTarget === "source" ? "hover" : "available")} />
           <PathField label="Carpeta Destino" value={dest}   onChange={onDestChange}
-            color="purple"  placeholder="D:\ruta\de\destino" onBrowse={onGoToExplorer} />
+            color="purple"  placeholder={elevated ? "D:\\ruta\\de\\destino" : "D:\\ruta\\de\\destino  (o arrastrá una carpeta acá)"} onBrowse={onGoToExplorer}
+            fieldRef={dstFieldRef} dropState={dragTarget && (dragTarget === "dest" ? "hover" : "available")} />
         </div>
+
+        {needsAdmin && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 bg-amber-950/40 border border-amber-800/60 rounded-lg text-xs text-amber-300">
+            <span className="flex-1 min-w-0">
+              El <span className="font-mono">Modo backup (/B)</span> necesita permisos de administrador.
+              La app se reabre elevada con esta misma configuración.
+              {adminErr && <span className="block text-red-300 mt-0.5">{adminErr}</span>}
+            </span>
+            <button onClick={handleRelaunchAdmin} disabled={running}
+              className="px-3 py-1.5 rounded-md bg-amber-700 hover:bg-amber-600 text-white font-medium disabled:opacity-50 shrink-0">
+              🛡 Reiniciar como administrador
+            </button>
+          </div>
+        )}
+
+        {dropMsg && (
+          <div className="px-3 py-2 bg-amber-950/40 border border-amber-800/60 rounded-lg text-xs text-amber-300">
+            {dropMsg}
+          </div>
+        )}
 
         {/* Copiar la carpeta en sí o solo su contenido */}
         {canIncludeParent && (
@@ -1532,9 +1671,15 @@ function FileTypeBadge({ ext }) {
 
 // ─── Sub-componentes pequeños ────────────────────────────────────────────────
 
-function PathField({ label, value, onChange, color, placeholder, onBrowse }) {
+function PathField({ label, value, onChange, color, placeholder, onBrowse, fieldRef, dropState }) {
   const focusColor = color === "emerald" ? "focus:border-emerald-500" : "focus:border-purple-500";
   const textColor  = color === "emerald" ? "text-emerald-500" : "text-purple-500";
+  // Resaltado mientras se arrastra algo desde Windows
+  const dropClass = dropState === "hover"
+    ? (color === "emerald" ? "ring-2 ring-emerald-400 bg-emerald-950/40" : "ring-2 ring-purple-400 bg-purple-950/40")
+    : dropState === "available"
+      ? (color === "emerald" ? "ring-1 ring-emerald-800" : "ring-1 ring-purple-800")
+      : "";
 
   async function handleNativeDialog() {
     try {
@@ -1544,8 +1689,11 @@ function PathField({ label, value, onChange, color, placeholder, onBrowse }) {
   }
 
   return (
-    <div>
-      <label className="block text-xs text-gray-500 uppercase tracking-wider mb-1.5">{label}</label>
+    <div ref={fieldRef} className={`-m-1.5 p-1.5 rounded-lg transition-all duration-150 ${dropClass}`}>
+      <label className="block text-xs text-gray-500 uppercase tracking-wider mb-1.5">
+        {label}
+        {dropState === "hover" && <span className={`ml-2 normal-case tracking-normal ${textColor}`}>— soltá acá</span>}
+      </label>
       <div className="flex gap-2">
         <div className="relative flex-1">
           <input type="text" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}

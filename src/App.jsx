@@ -113,6 +113,31 @@ export default function App() {
     setActiveTab("robocopy");
   }
 
+  // ── Administrador bajo demanda ──
+  // La app arranca sin admin; clonar discos y /B la relanzan elevada conservando el estado.
+  const [elevated, setElevated] = useState(false);
+  useEffect(() => {
+    invoke("is_elevated").then(setElevated).catch(() => {});
+    invoke("take_relaunch_state").then(raw => {
+      if (!raw) return;
+      try {
+        const st = JSON.parse(raw);
+        if (st.job) setLoadedJob({ ...st.job, _ts: Date.now() });
+        if (st.tab) setActiveTab(st.tab);
+      } catch (_) {}
+    }).catch(() => {});
+  }, []);
+
+  // Devuelve un mensaje de error si el usuario cancela el UAC (si no, la app se cierra y reabre)
+  async function relaunchAsAdmin(state) {
+    try {
+      await invoke("relaunch_as_admin", { state: JSON.stringify(state ?? {}) });
+      return null;
+    } catch (e) {
+      return String(e);
+    }
+  }
+
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-gray-100 overflow-hidden">
 
@@ -178,6 +203,12 @@ export default function App() {
             </svg>
           </div>
           <h1 className="font-semibold text-sm text-gray-100">RoboCopy GUI</h1>
+          {elevated && (
+            <span title="La app corre como administrador. Arrastrar desde el Explorador no funciona en este modo (lo bloquea Windows)."
+              className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-900/50 border border-amber-700/60 text-amber-300">
+              ADMIN
+            </span>
+          )}
         </div>
 
         {/* Indicadores de rutas seleccionadas */}
@@ -299,18 +330,26 @@ export default function App() {
             sourceFiles={sourceFiles}
             sourceFolders={sourceFolders}
             onSourceChange={path => { setSourcePath(path); setSourceFolders([]); setSourceFiles([]); }}
+            onSourceSelect={(path, files, folders) => {
+              setSourcePath(path);
+              setSourceFiles(files || []);
+              setSourceFolders(folders || []);
+            }}
             onDestChange={setDestPath}
             onGoToExplorer={() => setActiveTab("explorer")}
             loadedJob={loadedJob}
             onJobSaved={() => setJobsVersion(v => v + 1)}
             onStatusChange={setCopyStatus}
+            elevated={elevated}
+            onRelaunchAdmin={job => relaunchAsAdmin({ tab: "robocopy", job })}
           />
         </div>
         <div className={activeTab === "history" ? "h-full" : "hidden h-full"}>
           <JobHistory onLoadJob={handleLoadJob} jobsVersion={jobsVersion} />
         </div>
         <div className={activeTab === "clone" ? "h-full" : "hidden h-full"}>
-          <CloneDisk onCloningChange={setCloning} />
+          <CloneDisk onCloningChange={setCloning} elevated={elevated}
+            onRelaunchAdmin={() => relaunchAsAdmin({ tab: "clone" })} />
         </div>
         <div className={activeTab === "help" ? "h-full" : "hidden h-full"}>
           <HelpPanel />
