@@ -5,7 +5,7 @@ const path = require("path");
 
 const newVersion = process.argv[2];
 if (!newVersion || !/^\d+\.\d+\.\d+$/.test(newVersion)) {
-  console.error("Uso: npm run bump <version>  →  ejemplo: npm run bump 2.2.0");
+  console.error("Uso: npm run act_version <version>  →  ejemplo: npm run act_version 2.2.0");
   process.exit(1);
 }
 
