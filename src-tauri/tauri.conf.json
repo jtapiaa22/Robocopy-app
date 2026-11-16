@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzNzU4QjNFRjY2ODZEOTMKUldTVGJXajJQb3QxRXpzWk1QRGRZby9HdkEvb3dlMm5lYlVPeUdobmNTWXJCWHdaZlVLc1U1ODUK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1NUQxOTU3OUM3MjJEQwpSV1RjSXNkNWxkRlZDOGxwVEJHRGdZUnBVMkJuL3ZuZFRoRlRpcEdwY01BZUUzRStMS1JZODVoYwo=",
       "endpoints": [
         "https://github.com/jtapiaa22/Robocopy-app/releases/latest/download/latest.json"
       ]

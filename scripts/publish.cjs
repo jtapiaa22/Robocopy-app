@@ -29,9 +29,72 @@ function findNewest(dir, pred) {
   return matches.length ? path.join(dir, matches[0].name) : null;
 }
 
-function ghUpload(file) {
-  console.log(`📤  Subiendo ${path.basename(file)}...`);
-  run(`gh release upload "${tag}" "${file}" --repo ${REPO}`);
+// ── GitHub API (sin necesidad de GitHub CLI) ─────────────────────────────────
+// Candidatos de token, en orden. Se usa el primero que tenga permiso de escritura
+// sobre el repo (p. ej. GH_TOKEN puede ser un token fine-grained solo de otros repos).
+function tokenCandidates() {
+  const list = [
+    ["GH_TOKEN_ROBOCOPY", process.env.GH_TOKEN_ROBOCOPY],
+  ];
+  // Credencial que git ya usa para hacer push a github.com (Git Credential Manager)
+  try {
+    const out = execSync("git credential fill", {
+      input: "protocol=https\nhost=github.com\n\n",
+      stdio: ["pipe", "pipe", "ignore"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    }).toString();
+    const m = out.match(/^password=(.+)$/m);
+    if (m) list.push(["credencial de git", m[1].trim()]);
+  } catch (_) {}
+  list.push(["GH_TOKEN", process.env.GH_TOKEN], ["GITHUB_TOKEN", process.env.GITHUB_TOKEN]);
+  return list.filter(([, t]) => t);
+}
+
+// ¿El token puede escribir en el repo? (consulta de solo lectura a la API)
+function canPush(token) {
+  const { spawnSync } = require("child_process");
+  const code = `fetch("https://api.github.com/repos/${REPO}", { headers: {
+      Authorization: "Bearer " + process.env.T, "User-Agent": "robocopy-gui-publish" } })
+    .then(r => r.json()).then(j => console.log(j.permissions && j.permissions.push ? "1" : "0"))
+    .catch(() => console.log("0"));`;
+  const r = spawnSync(process.execPath, ["-e", code], { env: { ...process.env, T: token }, encoding: "utf8" });
+  return (r.stdout || "").trim() === "1";
+}
+
+function getGithubToken() {
+  for (const [name, token] of tokenCandidates()) {
+    if (canPush(token)) {
+      console.log(`🔐  Token de GitHub: ${name}`);
+      return token;
+    }
+    console.log(`   (${name} no tiene permiso de escritura sobre ${REPO})`);
+  }
+  return null;
+}
+
+async function githubApi(token, method, url, body, contentType = "application/json") {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "robocopy-gui-publish",
+      ...(body ? { "Content-Type": contentType } : {}),
+    },
+    body: body == null ? undefined : (contentType === "application/json" ? JSON.stringify(body) : body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GitHub ${method} ${url} → ${res.status}: ${text.slice(0, 300)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+// Sube un archivo al release y devuelve la URL pública de descarga
+async function ghUpload(token, release, file, uploadName = path.basename(file)) {
+  console.log(`📤  Subiendo ${uploadName}...`);
+  const url = `https://uploads.github.com/repos/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(uploadName)}`;
+  const asset = await githubApi(token, "POST", url, fs.readFileSync(file), "application/octet-stream");
+  return asset.browser_download_url;
 }
 
 // Crea un ZIP con método STORED (método 0) en puro Node.js.
@@ -119,6 +182,13 @@ try {
   process.exit(1);
 } catch (_) {}
 
+const ghToken = getGithubToken();
+if (!ghToken) {
+  console.error(`❌  Ningún token de GitHub puede escribir en ${REPO}.`);
+  console.error("   Creá uno fine-grained con 'Contents: Read and write' sobre este repo y guardalo en GH_TOKEN_ROBOCOPY.");
+  process.exit(1);
+}
+
 // ── Clave de firma ────────────────────────────────────────────────────────────
 
 const keyFile = path.resolve(__dirname, "../.tauri-signing-key");
@@ -191,34 +261,39 @@ run(`git tag ${tag}`);
 run("git push origin main");
 run(`git push origin ${tag}`);
 
-// ── Release ───────────────────────────────────────────────────────────────────
+// ── Release + archivos + latest.json ──────────────────────────────────────────
 
-console.log("\n📦  Creando release en GitHub...");
-run(`gh release create "${tag}" --title "RoboCopy GUI ${tag}" --notes "Nueva versión ${tag}" --repo ${REPO}`);
+(async () => {
+  console.log("\n📦  Creando release en GitHub...");
+  const release = await githubApi(ghToken, "POST", `https://api.github.com/repos/${REPO}/releases`, {
+    tag_name: tag,
+    name:     `RoboCopy GUI ${tag}`,
+    body:     `Nueva versión ${tag}`,
+  });
 
-// ── Subir archivos ────────────────────────────────────────────────────────────
+  const urls = {};
+  for (const file of [nsisExe, nsisZip, nsisSig, msiFile].filter(Boolean)) {
+    urls[file] = await ghUpload(ghToken, release, file);
+  }
 
-const toUpload = [nsisExe, nsisZip, nsisSig, msiFile].filter(Boolean);
-for (const file of toUpload) ghUpload(file);
+  // URL real que devolvió GitHub (normaliza espacios del nombre, etc.)
+  const latestJson = {
+    version,
+    notes:    `Nueva versión de RoboCopy GUI ${tag}.`,
+    pub_date: new Date().toISOString(),
+    platforms: {
+      "windows-x86_64": { signature: fs.readFileSync(nsisSig, "utf-8").trim(), url: urls[nsisZip] },
+    },
+  };
 
-// ── latest.json ───────────────────────────────────────────────────────────────
+  const latestPath = path.resolve(__dirname, "../latest.json");
+  fs.writeFileSync(latestPath, JSON.stringify(latestJson, null, 2));
+  await ghUpload(ghToken, release, latestPath, "latest.json");
 
-const sig     = fs.readFileSync(nsisSig, "utf-8").trim();
-const zipBase = path.basename(nsisZip);
-const url     = `https://github.com/${REPO}/releases/download/${tag}/${zipBase.replace(/ /g, ".")}`;
-
-const latestJson = {
-  version,
-  notes:    `Nueva versión de RoboCopy GUI ${tag}.`,
-  pub_date: new Date().toISOString(),
-  platforms: {
-    "windows-x86_64": { signature: sig, url },
-  },
-};
-
-const latestPath = path.resolve(__dirname, "../latest.json");
-fs.writeFileSync(latestPath, JSON.stringify(latestJson, null, 2));
-ghUpload(latestPath);
-
-console.log(`\n✅  Release ${tag} publicado!`);
-console.log(`   https://github.com/${REPO}/releases/tag/${tag}\n`);
+  console.log(`\n✅  Release ${tag} publicado!`);
+  console.log(`   ${release.html_url}\n`);
+})().catch(e => {
+  console.error(`\n❌  Error publicando el release: ${e.message}`);
+  console.error(`   El tag ${tag} ya se subió. Podés borrar el release a medias en GitHub y reintentar subiendo los archivos.`);
+  process.exit(1);
+});
