@@ -5,6 +5,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getFileType } from "../fileTypes";
+import NewFolderButton from "./NewFolderButton";
 
 // ─── Interpreta el exit code de robocopy ────────────────────────────────────
 
@@ -1039,7 +1040,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             fieldRef={srcFieldRef} dropState={dragTarget && (dragTarget === "source" ? "hover" : "available")} />
           <PathField label="Carpeta Destino" value={dest}   onChange={onDestChange}
             color="purple"  placeholder={elevated ? "D:\\ruta\\de\\destino" : "D:\\ruta\\de\\destino  (o arrastrá una carpeta acá)"} onBrowse={onGoToExplorer}
-            fieldRef={dstFieldRef} dropState={dragTarget && (dragTarget === "dest" ? "hover" : "available")} />
+            allowNewFolder fieldRef={dstFieldRef} dropState={dragTarget && (dragTarget === "dest" ? "hover" : "available")} />
         </div>
 
         {needsAdmin && (
@@ -1832,7 +1833,7 @@ function FileTypeBadge({ ext }) {
 
 // ─── Sub-componentes pequeños ────────────────────────────────────────────────
 
-function PathField({ label, value, onChange, color, placeholder, onBrowse, fieldRef, dropState }) {
+function PathField({ label, value, onChange, color, placeholder, onBrowse, fieldRef, dropState, allowNewFolder }) {
   const focusColor = color === "emerald" ? "focus:border-emerald-500" : "focus:border-purple-500";
   const textColor  = color === "emerald" ? "text-emerald-500" : "text-purple-500";
   // Resaltado mientras se arrastra algo desde Windows
@@ -1878,6 +1879,11 @@ function PathField({ label, value, onChange, color, placeholder, onBrowse, field
           className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-400 transition-colors">
           📂
         </button>
+        {/* Crear una subcarpeta dentro del destino actual y usarla como destino */}
+        {allowNewFolder && (
+          <NewFolderButton variant="field" parent={value.trim()} onCreated={onChange}
+            disabledTitle="Elegí primero la carpeta destino; la nueva carpeta se crea adentro" />
+        )}
       </div>
       {value && <p className={`mt-1 text-xs ${textColor} truncate`} title={value}>{value}</p>}
     </div>

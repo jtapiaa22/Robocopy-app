@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getFileType } from "../fileTypes";
+import NewFolderButton from "./NewFolderButton";
 
 // Preferencias del Explorador que se recuerdan entre sesiones
 function readPref(key, fallback) {
@@ -435,6 +436,10 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
 
         {/* Seleccionar todo + ocultos + modo de vista */}
         <div className="flex items-center gap-1 ml-2 shrink-0">
+          {/* Nueva carpeta: se crea dentro de la carpeta actual y se entra en ella */}
+          {currentPath && (
+            <NewFolderButton parent={currentPath} onCreated={path => navigateTo(path)} />
+          )}
           {currentPath && visibleEntries.length > 0 && (
             <button
               onClick={toggleAll}

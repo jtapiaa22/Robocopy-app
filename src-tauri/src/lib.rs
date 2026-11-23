@@ -318,6 +318,62 @@ async fn stream_output(app: tauri::AppHandle, mut stdout: tokio::process::ChildS
     }
 }
 
+// ─── Atributos de la carpeta destino ─────────────────────────────────────────
+
+// La raíz de un disco (ej. "F:\\") tiene los atributos Oculto + Sistema. Cuando robocopy
+// copia desde una raíz, se los pasa a la carpeta destino y esta "desaparece" en el
+// Explorador (había que hacer attrib -S -H a mano). Se limpian solo en la carpeta
+// destino; los archivos y subcarpetas copiados conservan sus atributos originales.
+#[cfg(target_os = "windows")]
+fn unhide_dest_if_root_source(src: &Path, dst: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileAttributesW(lpfilename: *const u16) -> u32;
+        fn SetFileAttributesW(lpfilename: *const u16, dwfileattributes: u32) -> i32;
+    }
+    const INVALID: u32 = 0xFFFF_FFFF;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+
+    // Solo si el origen es raíz de unidad y el destino NO lo es
+    if src.parent().is_some() || dst.parent().is_none() {
+        return;
+    }
+    let wide: Vec<u16> = dst.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let attrs = GetFileAttributesW(wide.as_ptr());
+        if attrs != INVALID && attrs & (HIDDEN | SYSTEM) != 0 {
+            SetFileAttributesW(wide.as_ptr(), attrs & !(HIDDEN | SYSTEM));
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unhide_dest_if_root_source(_src: &Path, _dst: &Path) {}
+
+// Crea una carpeta nueva dentro de `parent` y devuelve su ruta completa
+#[tauri::command]
+fn create_folder(parent: String, name: String) -> Result<String, String> {
+    let name = name.trim().trim_end_matches('.').trim();
+    if name.is_empty() {
+        return Err("Escribí un nombre para la carpeta.".into());
+    }
+    if name.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (c as u32) < 32) {
+        return Err("El nombre no puede tener estos caracteres: < > : \" / \\ | ? *".into());
+    }
+    let parent_path = Path::new(&parent);
+    if !parent_path.is_dir() {
+        return Err(format!("La carpeta no existe: {}", parent));
+    }
+    let target = parent_path.join(name);
+    if target.exists() {
+        return Err(format!("Ya existe \"{}\" en esta carpeta.", name));
+    }
+    std::fs::create_dir(&target).map_err(|e| format!("No se pudo crear la carpeta: {}", e))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
 // ─── Comandos: robocopy ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -354,6 +410,7 @@ async fn run_robocopy(
     let status = child.wait().await.map_err(|e| e.to_string())?;
     *state.pid.lock().unwrap() = None;
     let code = status.code().unwrap_or(-1);
+    unhide_dest_if_root_source(Path::new(&source), Path::new(&destination));
     let _ = app.emit("robocopy-done", code);
     Ok(code)
 }
@@ -647,6 +704,7 @@ async fn run_one_robocopy(
         Err(_) => 16,
     };
     *state.pid.lock().unwrap() = None;
+    unhide_dest_if_root_source(src, dst);
     code
 }
 
@@ -1261,6 +1319,7 @@ pub fn run() {
             reset_cancel,
             paths_are_dirs,
             open_in_explorer,
+            create_folder,
             is_elevated,
             relaunch_as_admin,
             take_relaunch_state,
