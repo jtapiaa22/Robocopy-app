@@ -551,6 +551,7 @@ async fn run_robocopy_multi(
     parent_source: String,
     parent_dest: String,
     folders: Vec<String>,
+    files: Option<Vec<String>>,
     flags: Vec<String>,
 ) -> Result<Vec<i32>, String> {
     let mut codes: Vec<i32> = vec![];
@@ -565,48 +566,88 @@ async fn run_robocopy_multi(
         let dst = Path::new(&parent_dest).join(folder);
 
         let _ = app.emit("robocopy-folder-start", folder.clone());
+        let code = run_one_robocopy(&app, &src, &dst, &[], &flags, folder).await;
+        codes.push(code);
+        let _ = app.emit("robocopy-folder-done", code);
+    }
 
-        let mut cmd = Command::new("robocopy");
-        cmd.arg(&src)
-            .arg(&dst)
-            .args(&flags)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        #[cfg(target_os = "windows")]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-        }
-
-        // Si una carpeta falla al iniciar, se registra como error (16) y se sigue con las demás
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = app.emit("robocopy-output", format!("ERROR: no se pudo iniciar robocopy para \"{}\": {}", folder, e));
-                codes.push(16);
-                let _ = app.emit("robocopy-folder-done", 16);
-                continue;
-            }
-        };
-        *state.pid.lock().unwrap() = child.id();
-
-        if let Some(stdout) = child.stdout.take() {
-            stream_output(app.clone(), stdout).await;
-        }
-
-        let code = match child.wait().await {
-            Ok(s) => s.code().unwrap_or(-1),
-            Err(_) => 16,
-        };
-        *state.pid.lock().unwrap() = None;
+    // Archivos sueltos seleccionados junto con las carpetas: se copian en una
+    // pasada extra, sin recursión (solo esos archivos de la carpeta padre).
+    let files = files.unwrap_or_default();
+    if !files.is_empty() && !state.cancelled.load(Ordering::SeqCst) {
+        let label = "(archivos sueltos)".to_string();
+        let file_flags: Vec<String> = flags
+            .iter()
+            .filter(|f| {
+                let u = f.to_uppercase();
+                !(u == "/E" || u == "/S" || u == "/MIR" || u == "/PURGE")
+            })
+            .cloned()
+            .collect();
+        let _ = app.emit("robocopy-folder-start", label.clone());
+        let code = run_one_robocopy(
+            &app,
+            Path::new(&parent_source),
+            Path::new(&parent_dest),
+            &files,
+            &file_flags,
+            &label,
+        )
+        .await;
         codes.push(code);
         let _ = app.emit("robocopy-folder-done", code);
     }
 
     let _ = app.emit("robocopy-all-done", &codes);
     Ok(codes)
+}
+
+// Ejecuta una pasada de robocopy (origen, destino, [archivos], flags) y devuelve su código.
+async fn run_one_robocopy(
+    app: &tauri::AppHandle,
+    src: &Path,
+    dst: &Path,
+    file_args: &[String],
+    flags: &[String],
+    label: &str,
+) -> i32 {
+    let state = app.state::<ProcessState>();
+
+    let mut cmd = Command::new("robocopy");
+    cmd.arg(src)
+        .arg(dst)
+        .args(file_args)
+        .args(flags)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    // Si falla al iniciar, se registra como error (16) y se sigue con lo demás
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = app.emit("robocopy-output", format!("ERROR: no se pudo iniciar robocopy para \"{}\": {}", label, e));
+            return 16;
+        }
+    };
+    *state.pid.lock().unwrap() = child.id();
+
+    if let Some(stdout) = child.stdout.take() {
+        stream_output(app.clone(), stdout).await;
+    }
+
+    let code = match child.wait().await {
+        Ok(s) => s.code().unwrap_or(-1),
+        Err(_) => 16,
+    };
+    *state.pid.lock().unwrap() = None;
+    code
 }
 
 // Envía CTRL_BREAK_EVENT al proceso de Robocopy para desbloquearlo sin matarlo.

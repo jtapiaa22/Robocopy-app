@@ -75,6 +75,14 @@ function isErrorLine(line) {
 
 // Mismas opciones que la copia real, pero como simulación silenciosa:
 // /L no copia nada, /NFL /NDL /NJH dejan solo el resumen, /BYTES da tamaños exactos.
+// Carpetas de sistema que se excluyen al copiar la raíz de un disco
+const DRIVE_ROOT_EXCLUDES = ["$RECYCLE.BIN", "System Volume Information"];
+
+// Flags para copiar solo archivos sueltos (sin recursión)
+function looseFileFlags(flags) {
+  return flags.filter(f => !/^\/(E|S|MIR|PURGE)$/i.test(f));
+}
+
 function buildScanFlags(flags) {
   const base = flags.filter(f => !/^\/(L|R:\d+|W:\d+)$/i.test(f));
   return [...base, "/L", "/NFL", "/NDL", "/NJH", "/BYTES", "/R:0", "/W:0"];
@@ -476,6 +484,13 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
   // Solo aplica en modo carpeta única (desde el Explorador ya se copia la carpeta en sí)
   const canIncludeParent = !!sourceFolderName && sourceFolders.length === 0 && sourceFiles.length === 0;
   const applyParent      = canIncludeParent && includeParent;
+  // Pasadas del modo multi-carpeta: cada carpeta + (si hay) los archivos sueltos
+  const LOOSE_FILES_LABEL = "(archivos sueltos)";
+  const multiItems = sourceFolders.length > 0
+    ? [...sourceFolders, ...(sourceFiles.length > 0 ? [LOOSE_FILES_LABEL] : [])]
+    : [];
+  // Origen = raíz de un disco (p. ej. "D:\"): se saltan carpetas de sistema
+  const sourceIsDriveRoot = /^[a-zA-Z]:[\\/]*$/.test((source || "").trim());
   const effectiveDest    = applyParent && dest
     ? `${dest.replace(/[\\/]+$/, "")}\\${sourceFolderName}`
     : dest;
@@ -714,7 +729,11 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
     const a = parseInt(maxAge, 10);
     if (!isNaN(a) && a >= 0) flags.push(`/MAXAGE:${a}`);
     if (excludeFiles.length > 0) flags.push("/XF", ...excludeFiles);
-    if (excludeDirs.length  > 0) flags.push("/XD", ...excludeDirs);
+    // Al copiar un disco entero, la papelera y "System Volume Information" solo dan errores de acceso
+    const xd = sourceIsDriveRoot
+      ? [...new Set([...excludeDirs, ...DRIVE_ROOT_EXCLUDES])]
+      : excludeDirs;
+    if (xd.length > 0) flags.push("/XD", ...xd);
     if (fileFilter.length   > 0 && sourceFolders.length === 0) flags.push("/IF", ...fileFilter);
     return flags;
   }
@@ -771,12 +790,14 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
       const pairs = multi
         ? sourceFolders.map(f => [joinWinPath(source, f), joinWinPath(dest, f)])
         : [[source, effectiveDest]];
+      // Archivos sueltos junto a carpetas: se escanean en el padre, sin recursión
+      if (multi && sourceFiles.length > 0) pairs.push([source, dest, [...looseFileFlags(flags), "/IF", ...sourceFiles]]);
       let sum = { files: 0, bytes: 0 };
       let scanErr = null;
       try {
-        for (const [s, d] of pairs) {
+        for (const [s, d, f] of pairs) {
           if (cancelReqRef.current) break;
-          const out = await invoke("scan_robocopy", { source: s, destination: d, flags: buildScanFlags(flags) });
+          const out = await invoke("scan_robocopy", { source: s, destination: d, flags: buildScanFlags(f ?? flags) });
           const t = parseScanTotals(out);
           if (!t) { sum = null; scanErr = "no se encontró el resumen en la salida"; break; }
           sum.files += t.files;
@@ -914,6 +935,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           parentSource: source,
           parentDest: dest,
           folders: sourceFolders,
+          files: sourceFiles,
           flags,
         });
       } catch (e) {
@@ -1066,10 +1088,11 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
         {sourceFolders.length > 0 && (
           <div className="flex items-start gap-2 px-3 py-2 bg-emerald-950/40 border border-emerald-800/50 rounded-lg">
             <span className="text-xs text-emerald-400 font-medium shrink-0 mt-0.5">
-              {sourceFolders.length} carpeta{sourceFolders.length !== 1 ? "s" : ""} a copiar:
+              {sourceFolders.length} carpeta{sourceFolders.length !== 1 ? "s" : ""}
+              {sourceFiles.length > 0 && ` + ${sourceFiles.length} archivo${sourceFiles.length !== 1 ? "s" : ""}`} a copiar:
             </span>
             <div className="flex flex-wrap gap-1 flex-1">
-              {sourceFolders.map(f => (
+              {[...sourceFolders, ...sourceFiles].map(f => (
                 <span key={f} className="px-2 py-0.5 bg-emerald-900/60 border border-emerald-700/50 rounded text-xs text-emerald-300 font-mono">
                   {f}
                 </span>
@@ -1266,7 +1289,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
             {isDryRun
             ? "🔍 Simular (sin copiar)"
             : sourceFolders.length > 0
-              ? `Copiar ${sourceFolders.length} carpeta(s)`
+              ? `Copiar ${sourceFolders.length} carpeta(s)${sourceFiles.length > 0 ? ` y ${sourceFiles.length} archivo(s)` : ""}`
               : "Iniciar"}
           </button>
         )}
@@ -1316,10 +1339,10 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                 ? "Calculando cuánto hay que copiar…"
                 : running
                 ? sourceFolders.length > 0
-                  ? `Carpeta ${multiFolderIdx} de ${sourceFolders.length}: "${sourceFolders[multiFolderIdx - 1] ?? ""}" — ${fileCount} archivos`
+                  ? `Paso ${multiFolderIdx} de ${multiItems.length}: "${multiItems[multiFolderIdx - 1] ?? ""}" — ${fileCount} archivos`
                   : `${isDryRun ? "Simulando" : "Copiando"}... ${fileCount > 0 ? `${fileCount} archivo${fileCount !== 1 ? "s" : ""} procesado${fileCount !== 1 ? "s" : ""}` : "iniciando"}`
                 : sourceFolders.length > 0
-                  ? `${sourceFolders.length} carpetas — ${multiFolderCodes.filter(c => c >= 8).length === 0 ? "completado" : "con errores"}`
+                  ? `${multiItems.length} pasos — ${multiFolderCodes.filter(c => c >= 8).length === 0 ? "completado" : "con errores"}`
                   : result?.desc}
             </span>
             {progress && (
@@ -1351,7 +1374,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
                 // Progreso escalonado por carpeta
                 <div
                   className="h-full bg-emerald-500 rounded-full transition-all duration-500"
-                  style={{ width: `${(multiFolderIdx / sourceFolders.length) * 100}%` }}
+                  style={{ width: `${(multiFolderIdx / multiItems.length) * 100}%` }}
                 />
               ) : (
                 // Shimmer para copia única
@@ -1367,7 +1390,7 @@ export default function RobocopyPanel({ source, dest, sourceFiles = [], sourceFo
           {/* Resumen por carpeta al terminar */}
           {!running && sourceFolders.length > 0 && multiFolderCodes.length > 0 && (
             <div className="flex flex-wrap gap-2 mt-2">
-              {sourceFolders.map((name, i) => {
+              {multiItems.map((name, i) => {
                 const code = multiFolderCodes[i];
                 const ok   = code !== undefined && code < 8;
                 return (

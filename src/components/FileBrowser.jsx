@@ -279,8 +279,50 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
   // Carpeta actualmente visible (para los botones de selección)
   const currentFolder = currentPath || null;
 
+  // ── Seleccionar todo ──
+  const checkedVisible = visibleEntries.filter(e => checkedItems.has(e.path)).length;
+  const allChecked     = visibleEntries.length > 0 && checkedVisible === visibleEntries.length;
+  const someChecked    = checkedVisible > 0 && !allChecked;
+
+  function toggleAll() {
+    setCheckedItems(allChecked ? new Set() : new Set(visibleEntries.map(e => e.path)));
+  }
+
+  // Ctrl+A selecciona todo / Esc limpia la selección (sin interferir con el campo de ruta)
+  function handleListKeyDown(e) {
+    if (e.target.tagName === "INPUT" && e.target.type !== "checkbox") return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      if (visibleEntries.length > 0) setCheckedItems(new Set(visibleEntries.map(ev => ev.path)));
+    } else if (e.key === "Escape" && checkedItems.size > 0) {
+      setCheckedItems(new Set());
+    }
+  }
+
+  function useAsSource() {
+    // Todo lo visible marcado = copiar la carpeta completa (incluye archivos sueltos,
+    // subcarpetas y lo que esté oculto). Es lo mismo que no marcar nada.
+    if (allChecked) { onSelectSource(currentFolder, [], []); return; }
+    const checked = entries.filter(e => checkedItems.has(e.path));
+    const files   = checked.filter(e => !e.is_dir).map(e => e.name);
+    const folders = checked.filter(e =>  e.is_dir).map(e => e.name);
+    onSelectSource(currentFolder, files, folders);
+  }
+
+  function sourceButtonLabel() {
+    if (allChecked) return "Origen (todo el contenido)";
+    if (checkedItems.size === 0) return "Usar como Origen";
+    const checked  = entries.filter(e => checkedItems.has(e.path));
+    const nFolders = checked.filter(e => e.is_dir).length;
+    const nFiles   = checked.filter(e => !e.is_dir).length;
+    const parts    = [];
+    if (nFolders) parts.push(`${nFolders} carp.`);
+    if (nFiles)   parts.push(`${nFiles} arch.`);
+    return `Origen (${parts.join(", ")})`;
+  }
+
   return (
-    <div className="flex flex-col h-full bg-gray-950 text-gray-100">
+    <div className="flex flex-col h-full bg-gray-950 text-gray-100 outline-none" tabIndex={-1} onKeyDown={handleListKeyDown}>
 
       {/* ── Barra de discos ──────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-4 py-2 bg-gray-900 border-b border-gray-800 flex-wrap">
@@ -391,8 +433,22 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
           </div>
         )}
 
-        {/* Ocultos + modo de vista */}
+        {/* Seleccionar todo + ocultos + modo de vista */}
         <div className="flex items-center gap-1 ml-2 shrink-0">
+          {currentPath && visibleEntries.length > 0 && (
+            <button
+              onClick={toggleAll}
+              title={allChecked ? "Quitar la selección (Esc)" : "Marcar todas las carpetas y archivos de esta carpeta (Ctrl+A)"}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-xs transition-colors
+                ${allChecked ? "bg-blue-600 text-white" : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"}`}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-3.5 h-3.5">
+                <rect x="3" y="3" width="18" height="18" rx="3" />
+                {allChecked ? <path d="M7 12l3.5 3.5L17 9" /> : someChecked ? <path d="M7 12h10" /> : null}
+              </svg>
+              {allChecked ? "Quitar selección" : "Seleccionar todo"}
+            </button>
+          )}
           <button
             onClick={toggleHidden}
             title={showHidden ? "Ocultar archivos ocultos y de sistema" : "Mostrar archivos ocultos y de sistema"}
@@ -418,7 +474,17 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
         {/* Cabecera de columnas */}
         {currentPath && viewMode === "list" && (
           <div className="grid grid-cols-[28px_1fr_100px_100px] gap-2 px-4 py-1.5 text-xs text-gray-600 uppercase tracking-wider border-b border-gray-800 sticky top-0 bg-gray-950 z-10">
-            <span />
+            <div className="flex items-center justify-center">
+              <input
+                type="checkbox"
+                checked={allChecked}
+                ref={el => { if (el) el.indeterminate = someChecked; }}
+                onChange={toggleAll}
+                disabled={visibleEntries.length === 0}
+                title="Seleccionar todo (Ctrl+A)"
+                className="w-4 h-4 accent-blue-500 cursor-pointer disabled:cursor-default disabled:opacity-30"
+              />
+            </div>
             <span>Nombre</span>
             <span className="text-right">Tamaño</span>
             <span className="text-right">Modificado</span>
@@ -547,7 +613,9 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
             <div className="flex-1 min-w-0">
               {checkedItems.size > 0 ? (
                 <p className="text-xs text-blue-400">
-                  {checkedItems.size} elemento{checkedItems.size !== 1 ? "s" : ""} seleccionado{checkedItems.size !== 1 ? "s" : ""}
+                  {allChecked
+                    ? `Todo seleccionado (${checkedItems.size} elemento${checkedItems.size !== 1 ? "s" : ""}): se copia la carpeta completa`
+                    : `${checkedItems.size} elemento${checkedItems.size !== 1 ? "s" : ""} seleccionado${checkedItems.size !== 1 ? "s" : ""}`}
                   <button
                     onClick={() => setCheckedItems(new Set())}
                     className="ml-2 text-gray-600 hover:text-gray-400 transition-colors underline"
@@ -562,31 +630,15 @@ export default function FileBrowser({ onSelectSource, onSelectDest, sourcePath, 
               )}
             </div>
             <button
-              onClick={() => {
-                const checked = entries.filter(e => checkedItems.has(e.path));
-                const files   = checked.filter(e => !e.is_dir).map(e => e.name);
-                const folders = checked.filter(e =>  e.is_dir).map(e => e.name);
-                onSelectSource(currentFolder, files, folders);
-              }}
+              onClick={useAsSource}
+              title={allChecked || checkedItems.size === 0 ? "Copiar todo el contenido de esta carpeta" : "Copiar solo lo marcado"}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors
                 ${sourcePath === currentFolder
                   ? "bg-emerald-600 text-white"
                   : "bg-emerald-900 hover:bg-emerald-700 text-emerald-300"
                 }`}
             >
-              {sourcePath === currentFolder
-                ? "✓ Origen"
-                : checkedItems.size > 0
-                  ? (() => {
-                      const checked  = entries.filter(e => checkedItems.has(e.path));
-                      const nFolders = checked.filter(e => e.is_dir).length;
-                      const nFiles   = checked.filter(e => !e.is_dir).length;
-                      const parts    = [];
-                      if (nFolders) parts.push(`${nFolders} carp.`);
-                      if (nFiles)   parts.push(`${nFiles} arch.`);
-                      return `Origen (${parts.join(", ")})`;
-                    })()
-                  : "Usar como Origen"}
+              {sourcePath === currentFolder ? "✓ Origen" : sourceButtonLabel()}
             </button>
             <button
               onClick={() => onSelectDest(currentFolder)}
